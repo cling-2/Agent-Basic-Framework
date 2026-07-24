@@ -1,0 +1,6 @@
+*.exe
+node_modules
+dist
+.claude
+data
+.history
