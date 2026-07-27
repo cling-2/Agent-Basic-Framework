@@ -124,11 +124,14 @@ func (h *SettingsHandler) TestConnection(c *gin.Context) {
 
 	// 尝试创建 ChatModel 并调用
 	llmCfg := &agent.LLMConfig{
-		APIKey:      apiKey,
-		BaseURL:     req.BaseURL,
-		Model:       req.Model,
-		HeaderName:  "ksyun-code-type",
-		HeaderValue: "kingsoft-agent",
+		APIKey:          apiKey,
+		BaseURL:         req.BaseURL,
+		Model:           req.Model,
+		HeaderName:      "ksyun-code-type",
+		HeaderValue:     "kingsoft-agent",
+		MaxRetries:      2,
+		InitialBackoff:  500 * time.Millisecond,
+		MaxBackoff:      5 * time.Second,
 	}
 
 	chatModel, err := agent.NewChatModel(c.Request.Context(), llmCfg)

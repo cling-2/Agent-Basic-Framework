@@ -399,7 +399,7 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 	// 意图兜底检查：如果用户消息匹配高风险意图，但 LLM 未调用对应工具且无中断，
 	// 则基于意图强制触发 HITL 中断（确保高风险操作100%需要审批）
 	emitter.mu.Lock()
-	intentInterrupt := h.checkIntentRisk(message, emitter.calledToolNames, emitter.sentInterrupt)
+	intentInterrupt := h.checkIntentRisk(ctx, message, emitter.calledToolNames, emitter.sentInterrupt)
 	emitter.mu.Unlock()
 	if intentInterrupt != nil {
 		// 将意图中断也存入 ApprovalStore，以便 ResumeStream 统一处理
@@ -559,9 +559,9 @@ func (m *MemoryIntentRiskChecker) CheckIntentRisk(message string) (string, strin
 }
 
 // checkIntentRisk 后置意图兜底检查
-// 条件：用户消息匹配高风险意图 + LLM 未调用对应工具 + 无已有中断
+// 条件：用户消息匹配高风险意图 + LLM 未调用对应工具 + 无已有中断 + 用户有 ACL 权限
 // 效果：基于意图强制触发 HITL 中断，确保高风险操作100%需要审批
-func (h *AgentHandler) checkIntentRisk(message string, calledToolNames map[string]bool, alreadyInterrupted bool) *hitl.InterruptInfo {
+func (h *AgentHandler) checkIntentRisk(ctx context.Context, message string, calledToolNames map[string]bool, alreadyInterrupted bool) *hitl.InterruptInfo {
 	if alreadyInterrupted || h.intentRiskChecker == nil {
 		return nil
 	}
@@ -576,7 +576,24 @@ func (h *AgentHandler) checkIntentRisk(message string, calledToolNames map[strin
 		return nil
 	}
 
-	// LLM 未调用高风险工具，但用户意图匹配 → 基于意图强制中断
+	// ACL 门控：如果用户无权调用该工具，不触发意图兜底中断
+	// 此场景下 ACL 中间件已在工具调用路径中拒绝了请求，无需再触发 HITL
+	uc, ok := pkgmodel.UserContextFromCtx(ctx)
+	if !ok {
+		log.Printf("[SSE/Intent] 无法获取UserContext，跳过意图兜底中断")
+		return nil
+	}
+	allowed, aclErr := h.aclChecker.Allowed(ctx, uc.Role, toolName, "execute")
+	if aclErr != nil {
+		log.Printf("[SSE/Intent] ACL检查失败: %v，跳过意图兜底中断", aclErr)
+		return nil
+	}
+	if !allowed {
+		log.Printf("[SSE/Intent] 用户角色[%s]无权调用工具[%s]，ACL已在中间件路径拒绝，跳过意图兜底", uc.Role, toolName)
+		return nil
+	}
+
+	// 用户有权限 + LLM 未调用高风险工具 + 意图匹配 → 基于意图强制中断
 	log.Printf("[SSE/Intent] 意图兜底触发: message=%q matchedTool=%s risk=%s", message, toolName, riskReason)
 
 	return &hitl.InterruptInfo{
