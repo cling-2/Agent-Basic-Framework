@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"kingsoft-agent/api"
 	"kingsoft-agent/internal/agent"
@@ -50,11 +51,14 @@ func main() {
 	// 5. 创建 ChatModel（优先使用持久化配置，其次环境变量，最后回退Mock）
 	savedSettings := settingsStore.Get()
 	llmCfg := &agent.LLMConfig{
-		APIKey:      firstNonEmpty(savedSettings.APIKey, os.Getenv("LLM_API_KEY")),
-		BaseURL:     firstNonEmpty(savedSettings.BaseURL, os.Getenv("LLM_BASE_URL")),
-		Model:       firstNonEmpty(savedSettings.Model, os.Getenv("LLM_MODEL")),
-		HeaderName:  "ksyun-code-type",
-		HeaderValue: "kingsoft-agent",
+		APIKey:          firstNonEmpty(savedSettings.APIKey, os.Getenv("LLM_API_KEY")),
+		BaseURL:         firstNonEmpty(savedSettings.BaseURL, os.Getenv("LLM_BASE_URL")),
+		Model:           firstNonEmpty(savedSettings.Model, os.Getenv("LLM_MODEL")),
+		HeaderName:      "ksyun-code-type",
+		HeaderValue:     "kingsoft-agent",
+		MaxRetries:      5,
+		InitialBackoff:  1 * time.Second,
+		MaxBackoff:      30 * time.Second,
 	}
 	chatModel, err := agent.NewChatModel(ctx, llmCfg)
 	if err != nil {
@@ -145,11 +149,14 @@ func main() {
 	// 11. 创建配置 Handler（带重建回调）
 	settingsHandler := settings.NewSettingsHandler(settingsStore, func(s settings.LLMSettings) error {
 		newCfg := &agent.LLMConfig{
-			APIKey:      s.APIKey,
-			BaseURL:     s.BaseURL,
-			Model:       s.Model,
-			HeaderName:  "ksyun-code-type",
-			HeaderValue: "kingsoft-agent",
+			APIKey:          s.APIKey,
+			BaseURL:         s.BaseURL,
+			Model:           s.Model,
+			HeaderName:      "ksyun-code-type",
+			HeaderValue:     "kingsoft-agent",
+			MaxRetries:      5,
+			InitialBackoff:  1 * time.Second,
+			MaxBackoff:      30 * time.Second,
 		}
 		newChatModel, err := agent.NewChatModel(ctx, newCfg)
 		if err != nil {
