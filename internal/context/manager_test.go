@@ -269,3 +269,144 @@ func TestProcess_EmptyInput(t *testing.T) {
 		t.Errorf("nil input should return nil/empty, got %d messages", len(result))
 	}
 }
+
+func TestNewContextManager(t *testing.T) {
+	mgr := NewContextManager(ContextManagerConfig{
+		MaxMessages:      20,
+		MaxTokens:        8000,
+		SummaryThreshold: 0.8,
+	})
+	if mgr == nil {
+		t.Fatal("expected non-nil ContextManager")
+	}
+	// Without ChatModel, summarizer should be nil
+	dmgr := mgr.(*defaultContextManager)
+	dmgr.mu.RLock()
+	s := dmgr.summarizer
+	dmgr.mu.RUnlock()
+	if s != nil {
+		t.Error("expected nil summarizer when ChatModel is nil")
+	}
+}
+
+func TestNewContextManager_WithChatModel(t *testing.T) {
+	stub := NewStubChatModel("summary")
+	mgr := NewContextManager(ContextManagerConfig{
+		MaxMessages:      20,
+		MaxTokens:        8000,
+		SummaryThreshold: 0.8,
+		ChatModel:        stub,
+	})
+	dmgr := mgr.(*defaultContextManager)
+	dmgr.mu.RLock()
+	s := dmgr.summarizer
+	dmgr.mu.RUnlock()
+	if s == nil {
+		t.Error("expected non-nil summarizer when ChatModel is provided")
+	}
+}
+
+func TestSetConfig(t *testing.T) {
+	stub := NewStubChatModel("summary")
+	mgr := NewContextManager(ContextManagerConfig{
+		MaxMessages: 20,
+		MaxTokens:   8000,
+	})
+
+	// Initially no summarizer
+	dmgr := mgr.(*defaultContextManager)
+	dmgr.mu.RLock()
+	s := dmgr.summarizer
+	dmgr.mu.RUnlock()
+	if s != nil {
+		t.Error("expected nil summarizer initially")
+	}
+
+	// SetConfig with ChatModel should rebuild summarizer
+	mgr.SetConfig(ContextManagerConfig{
+		MaxMessages:      10,
+		MaxTokens:        4000,
+		SummaryThreshold: 0.8,
+		ChatModel:        stub,
+	})
+
+	dmgr.mu.RLock()
+	s = dmgr.summarizer
+	cfg := dmgr.config
+	dmgr.mu.RUnlock()
+	if s == nil {
+		t.Error("expected non-nil summarizer after SetConfig")
+	}
+	if cfg.MaxTokens != 4000 {
+		t.Errorf("expected MaxTokens=4000, got %d", cfg.MaxTokens)
+	}
+}
+
+func TestSetConfig_RemoveChatModel(t *testing.T) {
+	stub := NewStubChatModel("summary")
+	mgr := NewContextManager(ContextManagerConfig{
+		MaxMessages:      20,
+		MaxTokens:        8000,
+		SummaryThreshold: 0.8,
+		ChatModel:        stub,
+	})
+
+	mgr.SetConfig(ContextManagerConfig{
+		MaxMessages: 20,
+		MaxTokens:   8000,
+		// ChatModel = nil → summarizer should be cleared
+	})
+
+	dmgr := mgr.(*defaultContextManager)
+	dmgr.mu.RLock()
+	s := dmgr.summarizer
+	dmgr.mu.RUnlock()
+	if s != nil {
+		t.Error("expected nil summarizer after removing ChatModel")
+	}
+}
+
+func TestDefaultConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.MaxMessages != 20 {
+		t.Errorf("expected MaxMessages=20, got %d", cfg.MaxMessages)
+	}
+	if cfg.MaxTokens != 8000 {
+		t.Errorf("expected MaxTokens=8000, got %d", cfg.MaxTokens)
+	}
+	if cfg.SummaryThreshold != 0.8 {
+		t.Errorf("expected SummaryThreshold=0.8, got %f", cfg.SummaryThreshold)
+	}
+}
+
+func TestProcess_FinalGuardMultipleDrops(t *testing.T) {
+	// Test that finalGuard iterates multiple times when needed
+	counter := NewMockTokenCounter(0)
+	msgs := []*schema.Message{
+		userMsg("a"), assistantMsg("b"),
+		userMsg("c"), assistantMsg("d"),
+		userMsg("e"), assistantMsg("f"),
+		userMsg("g"), assistantMsg("h"),
+	}
+	// Each message is 500 tokens, total = 4000, MaxTokens = 600
+	for _, m := range msgs {
+		counter.Set(m.Content, 500)
+	}
+
+	mgr := newTestManager(ContextManagerConfig{
+		MaxMessages: 20,
+		MaxTokens:   600,
+	}, counter)
+
+	result, err := mgr.Process(context.Background(), msgs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	totalTokens, _ := counter.CountMessages(context.Background(), result)
+	if totalTokens > 600 {
+		t.Errorf("FINAL_GUARD: expected tokens <= 600, got %d", totalTokens)
+	}
+	if len(result) == 0 {
+		t.Error("FINAL_GUARD: should retain at least some messages")
+	}
+}
