@@ -327,6 +327,10 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 	ctx = hitl.WithOriginalMessage(ctx, message)
 	ctx = pkgmodel.WithUserContext(ctx, uc)
 
+	// 注入 MessageCollector（供 Specialist 包装器捕获 ToolCall/ToolResult 中间消息）
+	collector := NewMessageCollector()
+	ctx = WithMessageCollector(ctx, collector)
+
 	opts := []flowagent.AgentOption{
 		flowagent.WithComposeOptions(compose.WithCallbacks(cb)),
 	}
@@ -426,6 +430,22 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 			Content: "⏸️ 操作需要人工审批，请在审批面板中确认。",
 			Interrupt: intentInterrupt,
 		})
+		// 等待 streaming goroutine 完成消息收集（5s 超时保护）
+		done := make(chan struct{})
+		go func() { collector.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			log.Printf("[SSE] Timeout waiting for message collector")
+		}
+		// 存储所有中间消息和最终回复
+		allMessages := collector.Messages()
+		for _, msg := range allMessages {
+			_ = h.messageStore.Append(ctx, threadID, msg)
+		}
+		if finalMessage != nil {
+			_ = h.messageStore.Append(ctx, threadID, finalMessage)
+		}
 		emitter.Emit(StreamEvent{Type: EventTypeDone})
 		return
 	}
@@ -438,32 +458,61 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 		emitter.Emit(StreamEvent{Type: EventTypeAnswer, Content: finalMessage.Content})
 	}
 
+	// 等待 streaming goroutine 完成消息收集（5s 超时保护）
+	done := make(chan struct{})
+	go func() { collector.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.Printf("[SSE] Timeout waiting for message collector")
+	}
+	// 存储所有中间消息和最终回复
+	allMessages := collector.Messages()
+	for _, msg := range allMessages {
+		_ = h.messageStore.Append(ctx, threadID, msg)
+	}
+	if finalMessage != nil {
+		_ = h.messageStore.Append(ctx, threadID, finalMessage)
+	}
+
 	emitter.Emit(StreamEvent{Type: EventTypeDone})
 }
 
 func consumeStreamWithInterrupt(stream *schema.StreamReader[*schema.Message]) (*schema.Message, *compose.InterruptInfo, error) {
-	var finalMessage *schema.Message
-	var lastRecvErr error
+	copies := stream.Copy(2)
+	sseStream := copies[0]
+	storeStream := copies[1]
 
+	// 消费 SSE stream 进行中断检测
+	var lastErr error
 	for {
-		msg, recvErr := stream.Recv()
+		_, recvErr := sseStream.Recv()
 		if recvErr != nil {
-			lastRecvErr = recvErr
+			lastErr = recvErr
 			break
 		}
-		if msg != nil {
-			finalMessage = msg
+	}
+
+	// 检查中断信息
+	var interruptInfo *compose.InterruptInfo
+	if lastErr != nil && lastErr != io.EOF {
+		if info, ok := compose.ExtractInterruptInfo(lastErr); ok {
+			interruptInfo = info
 		}
 	}
 
-	if lastRecvErr != nil && lastRecvErr != io.EOF {
-		if info, existed := compose.ExtractInterruptInfo(lastRecvErr); existed {
-			return finalMessage, info, nil
-		}
-		return finalMessage, nil, lastRecvErr
+	// 合并 store stream 为完整消息（用于存储）
+	finalMessage, concatErr := schema.ConcatMessageStream(storeStream)
+	if concatErr != nil {
+		log.Printf("[Stream] 合并流失败: %v", concatErr)
 	}
 
-	return finalMessage, nil, nil
+	// 非中断错误返回
+	if lastErr != nil && lastErr != io.EOF && interruptInfo == nil {
+		return finalMessage, nil, lastErr
+	}
+
+	return finalMessage, interruptInfo, nil
 }
 
 func (h *AgentHandler) streamHandleInterrupt(c *gin.Context, info *compose.InterruptInfo, threadID string) {
