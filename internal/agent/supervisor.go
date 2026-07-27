@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/flow/agent"
 	react "github.com/cloudwego/eino/flow/agent/react"
 	host "github.com/cloudwego/eino/flow/agent/multiagent/host"
 	"github.com/cloudwego/eino/schema"
@@ -80,8 +82,8 @@ func BuildSpecialists(
 				IntendedUse: def.IntendedUse,
 			},
 			SystemPrompt: def.SystemPrompt,
-			Invokable:    reactAgent.Generate,
-			Streamable:   reactAgent.Stream,
+			Invokable:    wrapSpecialistGenerate(reactAgent),
+			Streamable:   wrapSpecialistStream(reactAgent),
 		})
 	}
 
@@ -128,4 +130,85 @@ func CreateSupervisor(
 			SystemPrompt: "将多个专家的回复合并为一段连贯的最终回复。必须保留每个专家回复中的具体数值、结果和关键结论，不要省略具体数据。",
 		},
 	})
+}
+
+
+// ---------- Specialist æ¶æ¯æè·åè£å¨ ----------
+
+// wrapSpecialistGenerate åè£ Specialist ç Generate æ¹æ³
+// ä½¿ç¨ WithMessageFuture æè·ææä¸­é´æ¶æ¯ï¼ToolCall + ToolResult + æç»åå¤ï¼
+// éè¿ context ä¸­ç MessageCollector æ¶éï¼ä¾ handler å¨æ§è¡å®æ¯åå­å¨
+func wrapSpecialistGenerate(ra *react.Agent) func(ctx context.Context, input []*schema.Message, opts ...agent.AgentOption) (*schema.Message, error) {
+	return func(ctx context.Context, input []*schema.Message, opts ...agent.AgentOption) (*schema.Message, error) {
+		collector := GetMessageCollector(ctx)
+		if collector != nil {
+			opt, future := react.WithMessageFuture()
+			allOpts := append(opts, opt)
+			result, err := ra.Generate(ctx, input, allOpts...)
+			if err != nil {
+				return nil, err
+			}
+
+			// ä» MessageFuture æ¶éææä¸­é´æ¶æ¯
+			iter := future.GetMessages()
+			for {
+				msg, ok, iterErr := iter.Next()
+				if !ok || iterErr != nil {
+					break
+				}
+				if msg != nil {
+					collector.Add(msg)
+				}
+			}
+
+			return result, nil
+		}
+
+		// æ  collector æ¶éçº§ä¸ºç´æ¥è°ç¨ï¼ä¿æç°æè¡ä¸ºï¼
+		return ra.Generate(ctx, input, opts...)
+	}
+}
+
+// wrapSpecialistStream åè£ Specialist ç Stream æ¹æ³
+// ä½¿ç¨ WithMessageFuture æè·ææä¸­é´æ¶æ¯
+// streaming æ¨¡å¼ä¸æ¶æ¯éè¿å¼æ­¥ goroutine æ¶éï¼future.GetMessageStreamsï¼
+func wrapSpecialistStream(ra *react.Agent) func(ctx context.Context, input []*schema.Message, opts ...agent.AgentOption) (*schema.StreamReader[*schema.Message], error) {
+	return func(ctx context.Context, input []*schema.Message, opts ...agent.AgentOption) (*schema.StreamReader[*schema.Message], error) {
+		collector := GetMessageCollector(ctx)
+		if collector != nil {
+			opt, future := react.WithMessageFuture()
+			allOpts := append(opts, opt)
+			stream, err := ra.Stream(ctx, input, allOpts...)
+			if err != nil {
+				return nil, err
+			}
+
+			// å¼æ­¥æ¶éä¸­é´æ¶æ¯ï¼streaming æ¨¡å¼ä¸ MessageFuture éè¿ iterator åå streamï¼
+			done := collector.AddDelta()
+			go func() {
+				defer done()
+				sIter := future.GetMessageStreams()
+				for {
+					sr, ok, iterErr := sIter.Next()
+					if !ok || iterErr != nil {
+						break
+					}
+					if sr != nil {
+						msg, concatErr := schema.ConcatMessageStream(sr)
+						if concatErr == nil && msg != nil {
+							collector.Add(msg)
+						}
+						if concatErr != nil {
+							log.Printf("[Specialist/Stream] æ¶æ¯æµåå¹¶å¤±è´¥: %v", concatErr)
+						}
+					}
+				}
+			}()
+
+			return stream, nil
+		}
+
+		// æ  collector æ¶éçº§ä¸ºç´æ¥è°ç¨
+		return ra.Stream(ctx, input, opts...)
+	}
 }

@@ -26,7 +26,7 @@ import (
 )
 
 // AgentTimeout 单次 Agent 执行超时
-const AgentTimeout = 60 * time.Second
+const AgentTimeout = 180 * time.Second
 
 // ---------- 请求/响应结构体 ----------
 
@@ -154,6 +154,10 @@ func (h *AgentHandler) Chat(c *gin.Context) {
 	ctx = hitl.WithThreadID(ctx, req.ThreadID)
 	ctx = hitl.WithOriginalMessage(ctx, req.Message)
 
+	// 注入 MessageCollector（供 Specialist 包装器捕获 ToolCall/ToolResult 中间消息）
+	collector := NewMessageCollector()
+	ctx = WithMessageCollector(ctx, collector)
+
 	// 加载完整原始历史（MessageStore 存全量，不裁剪）
 	history, err := h.messageStore.Get(ctx, req.ThreadID)
 	if err != nil {
@@ -190,6 +194,11 @@ func (h *AgentHandler) Chat(c *gin.Context) {
 	if err != nil {
 		// 检测是否为 HITL 中断错误
 		if info, existed := compose.ExtractInterruptInfo(err); existed {
+			// 存储中断前已收集的消息（ToolCall 记录有价值）
+			allMessages := collector.Messages()
+			for _, msg := range allMessages {
+				_ = h.messageStore.Append(ctx, req.ThreadID, msg)
+			}
 			h.handleInterrupt(c, req, info)
 			return
 		}
@@ -213,9 +222,14 @@ func (h *AgentHandler) Chat(c *gin.Context) {
 		return
 	}
 
-	// 存储 Agent 完整原始回复到 MessageStore（不裁剪）
+	// 存储 Agent 执行过程中的所有中间消息（ToolCall + ToolResult）
+	allMessages := collector.Messages()
+	for _, msg := range allMessages {
+		_ = h.messageStore.Append(ctx, req.ThreadID, msg)
+	}
+	// 存储 Agent 最终回复
 	if result != nil {
-		_ = h.messageStore.Append(ctx, req.ThreadID, result) // 写入失败不影响当前
+		_ = h.messageStore.Append(ctx, req.ThreadID, result)
 	}
 
 	// 提取回复内容
@@ -324,6 +338,9 @@ func (h *AgentHandler) Resume(c *gin.Context) {
 	resumeCtx = hitl.WithThreadID(resumeCtx, threadID)
 	resumeCtx = hitl.WithOriginalMessage(resumeCtx, card.OriginalMessage)
 
+	collector := NewMessageCollector()
+	resumeCtx = WithMessageCollector(resumeCtx, collector)
+
 	// 注入 UserContext 到 resume context（中间件需要）
 	resumeCtx = pkgmodel.WithUserContext(resumeCtx, uc)
 
@@ -372,6 +389,16 @@ func (h *AgentHandler) Resume(c *gin.Context) {
 			Message: "resume execution failed",
 		}})
 		return
+	}
+
+	// 存储 Agent 执行过程中的所有中间消息（ToolCall + ToolResult）
+	allMessages := collector.Messages()
+	for _, msg := range allMessages {
+		_ = h.messageStore.Append(resumeCtx, threadID, msg)
+	}
+	// 存储 Agent 最终回复
+	if result != nil {
+		_ = h.messageStore.Append(resumeCtx, threadID, result)
 	}
 
 	reply := ""
@@ -588,6 +615,9 @@ func (h *AgentHandler) ResumeStream(c *gin.Context) {
 	resumeCtx = hitl.WithOriginalMessage(resumeCtx, card.OriginalMessage)
 	resumeCtx = pkgmodel.WithUserContext(resumeCtx, uc)
 
+	collector := NewMessageCollector()
+	resumeCtx = WithMessageCollector(resumeCtx, collector)
+
 	// 构造引导消息
 	var guidance string
 	if decision == hitl.DecisionApprove {
@@ -674,6 +704,23 @@ func (h *AgentHandler) ResumeStream(c *gin.Context) {
 	emitter.mu.Unlock()
 	if !sent && finalMessage != nil && finalMessage.Content != "" {
 		emitter.Emit(StreamEvent{Type: EventTypeAnswer, Content: finalMessage.Content})
+	}
+
+	// 等待 streaming goroutine 完成消息收集（5s 超时保护）
+	done := make(chan struct{})
+	go func() { collector.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.Printf("[SSE/Resume] Timeout waiting for message collector")
+	}
+	// 存储所有中间消息和最终回复
+	allMessages := collector.Messages()
+	for _, msg := range allMessages {
+		_ = h.messageStore.Append(resumeCtx, threadID, msg)
+	}
+	if finalMessage != nil {
+		_ = h.messageStore.Append(resumeCtx, threadID, finalMessage)
 	}
 
 	emitter.Emit(StreamEvent{Type: EventTypeDone})
