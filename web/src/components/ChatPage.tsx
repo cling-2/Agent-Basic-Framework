@@ -9,6 +9,7 @@ import {
   type InterruptInfo,
   type StreamEvent,
 } from '../api'
+import MarkdownRenderer from './MarkdownRenderer'
 
 interface ChatPageProps {
   onLogout: () => void
@@ -42,17 +43,6 @@ const QUICK_PROMPTS = [
   { label: '🔐 计算SHA256', message: '计算 hello 的SHA256哈希' },
   { label: '📧 发送邮件', message: '发送一封邮件' },
 ]
-
-// 轻量 Markdown 渲染
-function renderMarkdown(text: string): string {
-  let html = text
-    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="$1">$2</code></pre>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/^[-*] (.+)$/gm, '<li>$1</li>')
-    .replace(/\n/g, '<br/>')
-  return html
-}
 
 // 处理 SSE 流事件的通用逻辑
 // 返回一个处理函数，可复用于 handleSend 和 handleDecision
@@ -362,10 +352,9 @@ export default function ChatPage({ onLogout }: ChatPageProps) {
 
               {/* 最终答案 */}
               {msg.content ? (
-                <div
-                  className="bubble-content"
-                  dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
-                />
+                <div className="bubble-content">
+                  <MarkdownRenderer content={msg.content} />
+                </div>
               ) : null}
 
               {/* 打字指示器（无内容且无步骤时） */}
