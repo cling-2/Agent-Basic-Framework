@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"kingsoft-agent/internal/hitl"
+	"kingsoft-agent/internal/memory"
 	pkgmodel "kingsoft-agent/pkg/model"
 
 	"github.com/cloudwego/eino/callbacks"
@@ -82,17 +83,17 @@ func writeSSE(c *gin.Context, event StreamEvent) bool {
 // 而 Eino 回调的嵌套传播顺序可能不符合预期。状态机方式只在关键的 Specialist
 // OnStart/OnEnd 边界点切换状态，不依赖 depth 的精确时序。
 type SSEEmitter struct {
-	c               *gin.Context
-	threadID        string
-	sentAnswer      bool           // 是否已发射过 Host 层面的 answer
-	sentThinking    bool           // 是否已发射过 thinking（整个会话只一次）
-	sentInterrupt   bool           // 是否已从 OnError 中发射过 interrupt（抑制后续事件）
-	routedToSpecialist bool        // Specialist-as-tool OnStart 已触发
-	specialistCompleted bool       // Specialist-as-tool OnEnd 已触发
-	specialistNames map[string]bool // Specialist 名称集合
-	emittedCalls    map[string]bool // ChatModel 流中已见过的 ToolCall ID（用于去重）
-	calledToolNames map[string]bool // 实际被调用的工具名集合（OnStart 时记录，用于意图兜底）
-	mu              sync.Mutex
+	c                   *gin.Context
+	threadID            string
+	sentAnswer          bool            // 是否已发射过 Host 层面的 answer
+	sentThinking        bool            // 是否已发射过 thinking（整个会话只一次）
+	sentInterrupt       bool            // 是否已从 OnError 中发射过 interrupt（抑制后续事件）
+	routedToSpecialist  bool            // Specialist-as-tool OnStart 已触发
+	specialistCompleted bool            // Specialist-as-tool OnEnd 已触发
+	specialistNames     map[string]bool // Specialist 名称集合
+	emittedCalls        map[string]bool // ChatModel 流中已见过的 ToolCall ID（用于去重）
+	calledToolNames     map[string]bool // 实际被调用的工具名集合（OnStart 时记录，用于意图兜底）
+	mu                  sync.Mutex
 }
 
 func newSSEEmitter(c *gin.Context, threadID string, specialistNames map[string]bool) *SSEEmitter {
@@ -292,6 +293,18 @@ func (e *SSEEmitter) BuildCallback() callbacks.Handler {
 		Build()
 }
 
+// ---------- HITL 中断消息存储辅助 ----------
+
+// storeInterruptMessages 存储中断前已收集的消息和合成中断消息
+// 用于历史恢复时还原中断状态（前端切换会话后重新加载历史时，能看到中断卡片）
+func (h *AgentHandler) storeInterruptMessages(ctx context.Context, threadID string, collector *MessageCollector) {
+	allMessages := collector.Messages()
+	for _, msg := range allMessages {
+		_ = h.messageStore.Append(ctx, threadID, msg)
+	}
+	_ = h.messageStore.Append(ctx, threadID, schema.AssistantMessage("⏸️ 操作需要人工审批，请在下方审批面板中确认。", nil))
+}
+
 // ---------- ChatStream 流式对话 ----------
 
 func (h *AgentHandler) ChatStream(c *gin.Context) {
@@ -345,9 +358,17 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 
 	var fullMessages []*schema.Message
 	if history != nil {
-		fullMessages = append(history, userMsg)
-	} else {
-		fullMessages = []*schema.Message{userMsg}
+		fullMessages = append(fullMessages, history...)
+	}
+	fullMessages = append(fullMessages, userMsg)
+
+	// 加载长期记忆并注入到消息列表头部
+	if h.memoryStore != nil {
+		memoryEntries := memory.BuildMemoryInjectionForUser(h.memoryStore, uc.UserID)
+		memoryMsg := memory.BuildMemoryInjection(memoryEntries)
+		if memoryMsg != nil {
+			fullMessages = append([]*schema.Message{memoryMsg}, fullMessages...)
+		}
 	}
 
 	trimmedPrompt, processErr := h.contextManager.Process(ctx, fullMessages)
@@ -364,6 +385,7 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 	if streamErr != nil {
 		if info, existed := compose.ExtractInterruptInfo(streamErr); existed {
 			log.Printf("[SSE] 检测到HITL中断(Stream返回): contexts=%d", len(info.InterruptContexts))
+			h.storeInterruptMessages(ctx, threadID, collector)
 			h.streamHandleInterrupt(c, info, threadID)
 			return
 		}
@@ -384,10 +406,13 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 	emitter.mu.Unlock()
 	if interruptFromCallback {
 		return
+		// 存储中断消息，确保历史恢复时能还原中断状态
+		h.storeInterruptMessages(ctx, threadID, collector)
 	}
 
 	if interruptInfo != nil {
 		log.Printf("[SSE] 检测到HITL中断(Recv): contexts=%d", len(interruptInfo.InterruptContexts))
+		h.storeInterruptMessages(ctx, threadID, collector)
 		h.streamHandleInterrupt(c, interruptInfo, threadID)
 		return
 	}
@@ -408,26 +433,26 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 	if intentInterrupt != nil {
 		// 将意图中断也存入 ApprovalStore，以便 ResumeStream 统一处理
 		approvalInfo := hitl.ApprovalInfo{
-			ToolName:  intentInterrupt.ToolName,
-			ToolInput: intentInterrupt.ToolInput,
+			ToolName:   intentInterrupt.ToolName,
+			ToolInput:  intentInterrupt.ToolInput,
 			RiskReason: intentInterrupt.RiskReason,
-			CallID:    intentInterrupt.InterruptID,
-			ThreadID:  threadID,
-			UserID:    uc.UserID,
+			CallID:     intentInterrupt.InterruptID,
+			ThreadID:   threadID,
+			UserID:     uc.UserID,
 		}
 		card := &hitl.InterruptCard{
-			InterruptID:    intentInterrupt.InterruptID,
-			ApprovalInfo:   approvalInfo,
+			InterruptID:     intentInterrupt.InterruptID,
+			ApprovalInfo:    approvalInfo,
 			OriginalMessage: message,
-			CreatedAt:      time.Now(),
-			ExpiresAt:      time.Now().Add(hitl.DefaultApprovalTTL),
+			CreatedAt:       time.Now(),
+			ExpiresAt:       time.Now().Add(hitl.DefaultApprovalTTL),
 		}
 		bgCtx := context.Background()
 		h.approvalStore.AddApproval(bgCtx, threadID, card)
 
 		emitter.Emit(StreamEvent{
-			Type:    EventTypeInterrupt,
-			Content: "⏸️ 操作需要人工审批，请在审批面板中确认。",
+			Type:      EventTypeInterrupt,
+			Content:   "⏸️ 操作需要人工审批，请在审批面板中确认。",
 			Interrupt: intentInterrupt,
 		})
 		// 等待 streaming goroutine 完成消息收集（5s 超时保护）
@@ -444,6 +469,8 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 			_ = h.messageStore.Append(ctx, threadID, msg)
 		}
 		if finalMessage != nil {
+			// 存储合成中断消息，用于历史恢复时还原中断状态
+			_ = h.messageStore.Append(ctx, threadID, schema.AssistantMessage("â¸ï¸ æä½éè¦äººå·¥å®¡æ¹ï¼è¯·å¨ä¸æ¹å®¡æ¹é¢æ¿ä¸­ç¡®è®¤ã", nil))
 			_ = h.messageStore.Append(ctx, threadID, finalMessage)
 		}
 		emitter.Emit(StreamEvent{Type: EventTypeDone})
@@ -476,6 +503,11 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 	}
 
 	emitter.Emit(StreamEvent{Type: EventTypeDone})
+
+	// 后置：检测是否需要写入长期记忆（降级容错，不影响对话）
+	if h.memoryStore != nil {
+		memory.SaveMemoryFromConversation(h.memoryStore, uc.UserID, message, h.memoryExtractor)
+	}
 }
 
 func consumeStreamWithInterrupt(stream *schema.StreamReader[*schema.Message]) (*schema.Message, *compose.InterruptInfo, error) {
@@ -578,9 +610,9 @@ type MemoryIntentRiskChecker struct {
 
 // IntentPattern 意图匹配模式
 type IntentPattern struct {
-	Keywords []string // 匹配关键词（任意一个匹配即命中）
-	ToolName string   // 关联的高风险工具名
-	RiskReason string // 风险原因描述
+	Keywords   []string // 匹配关键词（任意一个匹配即命中）
+	ToolName   string   // 关联的高风险工具名
+	RiskReason string   // 风险原因描述
 }
 
 func NewMemoryIntentRiskChecker() *MemoryIntentRiskChecker {

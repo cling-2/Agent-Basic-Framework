@@ -12,6 +12,7 @@ import (
 	"kingsoft-agent/internal/auth"
 	ctxmgr "kingsoft-agent/internal/context"
 	"kingsoft-agent/internal/hitl"
+	"kingsoft-agent/internal/memory"
 	"kingsoft-agent/internal/settings"
 	"kingsoft-agent/internal/toolreg"
 	"kingsoft-agent/internal/toolreg/tools"
@@ -51,14 +52,14 @@ func main() {
 	// 5. 创建 ChatModel（优先使用持久化配置，其次环境变量，最后回退Mock）
 	savedSettings := settingsStore.Get()
 	llmCfg := &agent.LLMConfig{
-		APIKey:          firstNonEmpty(savedSettings.APIKey, os.Getenv("LLM_API_KEY")),
-		BaseURL:         firstNonEmpty(savedSettings.BaseURL, os.Getenv("LLM_BASE_URL")),
-		Model:           firstNonEmpty(savedSettings.Model, os.Getenv("LLM_MODEL")),
-		HeaderName:      "ksyun-code-type",
-		HeaderValue:     "kingsoft-agent",
-		MaxRetries:      5,
-		InitialBackoff:  1 * time.Second,
-		MaxBackoff:      30 * time.Second,
+		APIKey:         firstNonEmpty(savedSettings.APIKey, os.Getenv("LLM_API_KEY")),
+		BaseURL:        firstNonEmpty(savedSettings.BaseURL, os.Getenv("LLM_BASE_URL")),
+		Model:          firstNonEmpty(savedSettings.Model, os.Getenv("LLM_MODEL")),
+		HeaderName:     "ksyun-code-type",
+		HeaderValue:    "kingsoft-agent",
+		MaxRetries:     5,
+		InitialBackoff: 1 * time.Second,
+		MaxBackoff:     30 * time.Second,
 	}
 	chatModel, err := agent.NewChatModel(ctx, llmCfg)
 	if err != nil {
@@ -139,24 +140,29 @@ func main() {
 	}
 	contextManager := ctxmgr.NewContextManager(contextConfig)
 	tokenCounter := &ctxmgr.DefaultTokenCounter{}
-	contextHandler := ctxmgr.NewContextHandler(messageStore, contextManager, tokenCounter)
+	contextHandler := ctxmgr.NewContextHandler(messageStore, contextManager, tokenCounter, approvalStore)
 
-	// 10. 创建 Handler 和中间件
+	// 11. 创建长期记忆组件
+	memoryStore := memory.NewInMemoryMemoryStore()
+	memoryHandler := memory.NewMemoryHandler(memoryStore)
+	memoryExtractor := memory.NewLLMMemoryExtractor(baseChatModel)
+
+	// 12. 创建 Handler 和中间件
 	authHandler := auth.NewAuthHandler(userStore, sessionStore, aclChecker)
 	authMiddlewareGin := auth.AuthMiddleware(sessionStore, userStore, aclChecker)
-	agentHandler := agent.NewAgentHandler(supervisor, registry, aclChecker, specialistDefs, approvalStore, intentChecker, messageStore, contextManager)
+	agentHandler := agent.NewAgentHandler(supervisor, registry, aclChecker, specialistDefs, approvalStore, intentChecker, messageStore, contextManager, memoryStore, memoryExtractor)
 
 	// 11. 创建配置 Handler（带重建回调）
 	settingsHandler := settings.NewSettingsHandler(settingsStore, func(s settings.LLMSettings) error {
 		newCfg := &agent.LLMConfig{
-			APIKey:          s.APIKey,
-			BaseURL:         s.BaseURL,
-			Model:           s.Model,
-			HeaderName:      "ksyun-code-type",
-			HeaderValue:     "kingsoft-agent",
-			MaxRetries:      5,
-			InitialBackoff:  1 * time.Second,
-			MaxBackoff:      30 * time.Second,
+			APIKey:         s.APIKey,
+			BaseURL:        s.BaseURL,
+			Model:          s.Model,
+			HeaderName:     "ksyun-code-type",
+			HeaderValue:    "kingsoft-agent",
+			MaxRetries:     5,
+			InitialBackoff: 1 * time.Second,
+			MaxBackoff:     30 * time.Second,
 		}
 		newChatModel, err := agent.NewChatModel(ctx, newCfg)
 		if err != nil {
@@ -174,6 +180,9 @@ func main() {
 		newContextConfig.ChatModel = newBaseChatModel
 		contextManager.SetConfig(newContextConfig)
 
+		// 同步更新记忆提取器（LLM 配置变更后使用新模型提取记忆）
+		agentHandler.SetMemoryExtractor(memory.NewLLMMemoryExtractor(newBaseChatModel))
+
 		return nil
 	})
 
@@ -188,7 +197,7 @@ func main() {
 		c.File("./web/dist/index.html")
 	})
 
-	api.SetupRoutes(r, authHandler, authMiddlewareGin, agentHandler, settingsHandler, contextHandler)
+	api.SetupRoutes(r, authHandler, authMiddlewareGin, agentHandler, settingsHandler, contextHandler, memoryHandler)
 
 	addr := ":8080"
 	fmt.Printf("Kingsoft Agent Framework starting on %s\n", addr)

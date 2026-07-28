@@ -32,6 +32,13 @@ type LoginRequest struct {
 	Password string `json:"password" binding:"required"`
 }
 
+// RegisterRequest 注册请求
+type RegisterRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+	Role     string `json:"role" binding:"required"` // "admin" 或 "visitor"
+}
+
 // LoginResponse 登录响应
 type LoginResponse struct {
 	SessionID string `json:"session_id"`
@@ -74,9 +81,83 @@ var (
 	errBadRequest     = ErrorDetail{Code: "BAD_REQUEST", Message: "invalid request parameters"}
 	errInvalidCreds   = ErrorDetail{Code: "UNAUTHORIZED", Message: "invalid credentials"}
 	errUserDisabled   = ErrorDetail{Code: "UNAUTHORIZED", Message: "user account is disabled"}
+	errDuplicateUser  = ErrorDetail{Code: "CONFLICT", Message: "username already exists"}
 )
 
 // ---------- 处理器方法 ----------
+
+// Register 用户注册
+// POST /api/auth/register
+func (h *AuthHandler) Register(c *gin.Context) {
+	var req RegisterRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: errBadRequest})
+		return
+	}
+
+	// 映射角色名到角色 ID
+	roleIDMap := map[string]int64{
+		model.RoleAdmin:   1,
+		model.RoleVisitor: 2,
+	}
+	roleID, ok := roleIDMap[req.Role]
+	if !ok {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: ErrorDetail{
+			Code:    "BAD_REQUEST",
+			Message: "invalid role, must be 'admin' or 'visitor'",
+		}})
+		return
+	}
+
+	// 哈希密码
+	hash, err := hashPassword(req.Password)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: ErrorDetail{
+			Code:    "INTERNAL_ERROR",
+			Message: "failed to hash password",
+		}})
+		return
+	}
+
+	// 创建用户
+	user, err := h.userStore.CreateUser(c.Request.Context(), req.Username, hash, roleID)
+	if err != nil {
+		if err == ErrDuplicateUsername {
+			c.JSON(http.StatusConflict, ErrorResponse{Error: errDuplicateUser})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: ErrorDetail{
+			Code:    "INTERNAL_ERROR",
+			Message: "failed to create user",
+		}})
+		return
+	}
+
+	// 自动登录：创建 Session
+	session := NewSession(user.ID)
+	if err := h.sessionStore.Create(c.Request.Context(), session); err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: ErrorDetail{
+			Code:    "INTERNAL_ERROR",
+			Message: "failed to create session",
+		}})
+		return
+	}
+
+	c.JSON(http.StatusOK, LoginResponse{
+		SessionID: session.SessionID,
+		ExpiresIn: int64(model.DefaultSessionTTL.Seconds()),
+	})
+}
+
+// GetRoles 查询可选角色列表
+// GET /api/auth/roles
+func (h *AuthHandler) GetRoles(c *gin.Context) {
+	roles := []gin.H{
+		{ "id": 1, "name": model.RoleAdmin, "description": "管理员，可调用所有工具" },
+		{ "id": 2, "name": model.RoleVisitor, "description": "访客，仅可调用查询类工具" },
+	}
+	c.JSON(http.StatusOK, gin.H{"roles": roles})
+}
 
 // Login 用户登录
 // POST /api/auth/login

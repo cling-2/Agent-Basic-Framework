@@ -4,6 +4,7 @@ import (
 	"kingsoft-agent/internal/agent"
 	"kingsoft-agent/internal/auth"
 	ctxmgr "kingsoft-agent/internal/context"
+	"kingsoft-agent/internal/memory"
 	"kingsoft-agent/internal/settings"
 
 	"github.com/gin-gonic/gin"
@@ -17,11 +18,14 @@ func SetupRoutes(
 	agentHandler *agent.AgentHandler,
 	settingsHandler *settings.SettingsHandler,
 	contextHandler *ctxmgr.ContextHandler,
+	memoryHandler *memory.MemoryHandler,
 ) {
 	// 公开接口（无需认证）
 	authGroup := r.Group("/api/auth")
 	{
 		authGroup.POST("/login", handler.Login)
+		authGroup.POST("/register", handler.Register)
+		authGroup.GET("/roles", handler.GetRoles)
 	}
 
 	// 需要认证的接口
@@ -51,6 +55,12 @@ func SetupRoutes(
 
 		// 上下文管理接口
 		authorized.GET("/context/stats", contextHandler.GetStats)
+		authorized.GET("/context/history", contextHandler.GetHistory)
 		authorized.POST("/context/config", contextHandler.UpdateConfig)
+
+		// 长期记忆接口（userId 从 UserContext 获取，不从请求参数获取）
+		authorized.GET("/memory/list", memoryHandler.ListMemories)
+		authorized.POST("/memory/put", memoryHandler.PutMemory)
+		authorized.DELETE("/memory/:key", memoryHandler.DeleteMemory)
 	}
 }

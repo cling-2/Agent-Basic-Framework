@@ -9,10 +9,11 @@ import (
 
 // 错误定义
 var (
-	ErrUserNotFound    = errors.New("user not found")
-	ErrRoleNotFound    = errors.New("role not found")
-	ErrSessionNotFound = errors.New("session not found")
-	ErrSessionExpired  = errors.New("session expired")
+	ErrUserNotFound      = errors.New("user not found")
+	ErrRoleNotFound      = errors.New("role not found")
+	ErrSessionNotFound   = errors.New("session not found")
+	ErrSessionExpired    = errors.New("session expired")
+	ErrDuplicateUsername = errors.New("username already exists")
 )
 
 // hashPassword 使用 bcrypt 哈希密码（cost=12）

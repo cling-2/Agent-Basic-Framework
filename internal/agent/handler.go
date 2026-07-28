@@ -12,6 +12,7 @@ import (
 	"kingsoft-agent/internal/auth"
 	ctxmgr "kingsoft-agent/internal/context"
 	"kingsoft-agent/internal/hitl"
+	"kingsoft-agent/internal/memory"
 	"kingsoft-agent/internal/toolreg"
 	pkgmodel "kingsoft-agent/pkg/model"
 
@@ -38,8 +39,8 @@ type ChatRequest struct {
 
 // ChatResponse Agent 对话响应
 type ChatResponse struct {
-	Reply    string            `json:"reply"`
-	ThreadID string            `json:"thread_id"`
+	Reply     string              `json:"reply"`
+	ThreadID  string              `json:"thread_id"`
 	Interrupt *hitl.InterruptInfo `json:"interrupt,omitempty"` // 非 nil 表示执行被中断
 }
 
@@ -93,15 +94,17 @@ var (
 
 // AgentHandler Agent 相关 HTTP 接口处理器
 type AgentHandler struct {
-	mu             sync.RWMutex
-	supervisor     *host.MultiAgent
-	toolRegistry   *toolreg.ToolRegistry
-	aclChecker     auth.ACLChecker
-	agentDefs      []*SpecialistDef
-	approvalStore  *hitl.ApprovalStore
-	intentRiskChecker IntentRiskChecker      // 意图风险兜底检查器
-	messageStore   ctxmgr.MessageStore
-	contextManager ctxmgr.ContextManager
+	mu                sync.RWMutex
+	supervisor        *host.MultiAgent
+	toolRegistry      *toolreg.ToolRegistry
+	aclChecker        auth.ACLChecker
+	agentDefs         []*SpecialistDef
+	approvalStore     *hitl.ApprovalStore
+	intentRiskChecker IntentRiskChecker // 意图风险兜底检查器
+	messageStore      ctxmgr.MessageStore
+	contextManager    ctxmgr.ContextManager
+	memoryStore       memory.MemoryStore     // 长期记忆存储
+	memoryExtractor   memory.MemoryExtractor // LLM 记忆提取器
 }
 
 // NewAgentHandler 创建 Agent 处理器
@@ -114,16 +117,20 @@ func NewAgentHandler(
 	intentRiskChecker IntentRiskChecker,
 	messageStore ctxmgr.MessageStore,
 	contextManager ctxmgr.ContextManager,
+	memoryStore memory.MemoryStore,
+	memoryExtractor memory.MemoryExtractor,
 ) *AgentHandler {
 	return &AgentHandler{
-		supervisor:     supervisor,
-		toolRegistry:   toolRegistry,
-		aclChecker:     aclChecker,
-		agentDefs:      agentDefs,
-		approvalStore:  approvalStore,
+		supervisor:        supervisor,
+		toolRegistry:      toolRegistry,
+		aclChecker:        aclChecker,
+		agentDefs:         agentDefs,
+		approvalStore:     approvalStore,
 		intentRiskChecker: intentRiskChecker,
-		messageStore:   messageStore,
-		contextManager: contextManager,
+		messageStore:      messageStore,
+		contextManager:    contextManager,
+		memoryStore:       memoryStore,
+		memoryExtractor:   memoryExtractor,
 	}
 }
 
@@ -138,7 +145,7 @@ func (h *AgentHandler) Chat(c *gin.Context) {
 	}
 
 	// 验证 UserContext（已由 AuthMiddleware 注入）
-	_, ok := pkgmodel.UserContextFromCtx(c.Request.Context())
+	uc, ok := pkgmodel.UserContextFromCtx(c.Request.Context())
 	if !ok {
 		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: ErrorDetail{
 			Code: "UNAUTHORIZED", Message: "session invalid or expired",
@@ -172,9 +179,17 @@ func (h *AgentHandler) Chat(c *gin.Context) {
 	// 构造完整消息列表（用于 Process 输入）
 	var fullMessages []*schema.Message
 	if history != nil {
-		fullMessages = append(history, userMsg)
-	} else {
-		fullMessages = []*schema.Message{userMsg}
+		fullMessages = append(fullMessages, history...)
+	}
+	fullMessages = append(fullMessages, userMsg)
+
+	// 加载长期记忆并注入到消息列表头部
+	if h.memoryStore != nil {
+		memoryEntries := memory.BuildMemoryInjectionForUser(h.memoryStore, uc.UserID)
+		memoryMsg := memory.BuildMemoryInjection(memoryEntries)
+		if memoryMsg != nil {
+			fullMessages = append([]*schema.Message{memoryMsg}, fullMessages...)
+		}
 	}
 
 	// 上下文管理：Process 输出仅用于本次 LLM 调用，不回写 Store
@@ -199,6 +214,8 @@ func (h *AgentHandler) Chat(c *gin.Context) {
 			for _, msg := range allMessages {
 				_ = h.messageStore.Append(ctx, req.ThreadID, msg)
 			}
+			// 存储合成中断消息，用于历史恢复时还原中断状态
+			_ = h.messageStore.Append(ctx, req.ThreadID, schema.AssistantMessage("⏸️ 操作需要人工审批，请在下方审批面板中确认。", nil))
 			h.handleInterrupt(c, req, info)
 			return
 		}
@@ -242,6 +259,11 @@ func (h *AgentHandler) Chat(c *gin.Context) {
 		Reply:    reply,
 		ThreadID: req.ThreadID,
 	})
+
+	// 后置：检测是否需要写入长期记忆（降级容错，不影响对话）
+	if h.memoryStore != nil && reply != "" {
+		memory.SaveMemoryFromConversation(h.memoryStore, uc.UserID, req.Message, h.memoryExtractor)
+	}
 }
 
 // handleInterrupt 处理 HITL 中断响应
@@ -361,6 +383,10 @@ func (h *AgentHandler) Resume(c *gin.Context) {
 	messages := []*schema.Message{
 		schema.UserMessage(card.OriginalMessage + "\n\n" + guidance),
 	}
+
+	// 存储审批决策引导消息，确保历史中 assistant/user 交替出现
+	guidanceMsg := schema.UserMessage(guidance)
+	_ = h.messageStore.Append(resumeCtx, threadID, guidanceMsg)
 
 	// 上下文管理（恢复时也需裁剪，虽然通常只有 1 条消息会快速短路）
 	trimmed, processErr := h.contextManager.Process(resumeCtx, messages)
@@ -635,6 +661,9 @@ func (h *AgentHandler) ResumeStream(c *gin.Context) {
 	messages := []*schema.Message{
 		schema.UserMessage(card.OriginalMessage + "\n\n" + guidance),
 	}
+	// 存储审批决策引导消息，确保历史中 assistant/user 交替出现
+	guidanceMsg := schema.UserMessage(guidance)
+	_ = h.messageStore.Append(resumeCtx, threadID, guidanceMsg)
 
 	// 上下文管理
 	trimmed, processErr := h.contextManager.Process(resumeCtx, messages)
@@ -753,4 +782,11 @@ func (h *AgentHandler) RebuildSupervisor(
 
 	log.Println("[Agent] Supervisor 重建成功")
 	return nil
+}
+
+// SetMemoryExtractor 更新记忆提取器（LLM 配置变更时调用）
+func (h *AgentHandler) SetMemoryExtractor(extractor memory.MemoryExtractor) {
+	h.mu.Lock()
+	h.memoryExtractor = extractor
+	h.mu.Unlock()
 }

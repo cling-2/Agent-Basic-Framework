@@ -13,6 +13,8 @@ type UserStore interface {
 	GetByUsername(ctx context.Context, username string) (*model.User, error)
 	// GetByID 根据ID查询用户
 	GetByID(ctx context.Context, id int64) (*model.User, error)
+	// CreateUser 创建新用户（注册）
+	CreateUser(ctx context.Context, username, passwordHash string, roleID int64) (*model.User, error)
 }
 
 // MemoryUserStore 基于内存的用户存储
@@ -108,4 +110,46 @@ func (s *MemoryUserStore) GetRoleByID(_ context.Context, id int64) (*model.Role,
 		return nil, ErrRoleNotFound
 	}
 	return r, nil
+}
+
+// CreateUser 创建新用户（注册）
+// 返回 ErrDuplicateUsername 如果用户名已存在
+func (s *MemoryUserStore) CreateUser(_ context.Context, username, passwordHash string, roleID int64) (*model.User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 检查用户名是否已存在
+	if _, ok := s.byName[username]; ok {
+		return nil, ErrDuplicateUsername
+	}
+
+	// 自增 ID：取当前最大 ID + 1
+	maxID := int64(0)
+	for id := range s.users {
+		if id > maxID {
+			maxID = id
+		}
+	}
+	id := maxID + 1
+
+	now := timeNow()
+	roleName := ""
+	if r, ok := s.roles[roleID]; ok {
+		roleName = r.Name
+	}
+
+	user := &model.User{
+		ID:           id,
+		Username:     username,
+		PasswordHash: passwordHash,
+		RoleID:       roleID,
+		RoleName:     roleName,
+		Status:       model.UserEnabled,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	s.users[id] = user
+	s.byName[username] = user
+
+	return user, nil
 }
