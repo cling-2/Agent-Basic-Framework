@@ -4,7 +4,10 @@ import (
 	stdctx "context"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
+
+	"kingsoft-agent/internal/hitl"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -272,19 +275,42 @@ type ContextConfigRequest struct {
 	SummaryThreshold float64 `json:"summary_threshold"`
 }
 
+// InterruptMeta 中断元数据（前端用于还原 HITL 审批卡片）
+type InterruptMeta struct {
+	InterruptID string `json:"interrupt_id"`
+	ToolName    string `json:"tool_name"`
+	ToolInput   string `json:"tool_input"`
+	RiskReason  string `json:"risk_reason"`
+}
+
+// HistoryMessage 单条消息的历史记录（前端展示用）
+type HistoryMessage struct {
+	Role      string         `json:"role"`               // user / assistant
+	Content   string         `json:"content"`            // 消息正文
+	Interrupt *InterruptMeta `json:"interrupt,omitempty"` // HITL 中断元数据（仅中断消息携带）
+}
+
+// HistoryResponse 消息历史响应
+type HistoryResponse struct {
+	ThreadID  string           `json:"thread_id"`
+	Messages  []HistoryMessage `json:"messages"`
+}
+
 // ContextHandler 上下文管理 HTTP 处理器
 type ContextHandler struct {
-	messageStore    MessageStore
-	contextManager  ContextManager
-	counter         TokenCounter
+	messageStore   MessageStore
+	contextManager ContextManager
+	counter        TokenCounter
+	approvalStore  *hitl.ApprovalStore // 用于 GetHistory 中断元数据丰富
 }
 
 // NewContextHandler 创建上下文管理 HTTP 处理器
-func NewContextHandler(messageStore MessageStore, contextManager ContextManager, counter TokenCounter) *ContextHandler {
+func NewContextHandler(messageStore MessageStore, contextManager ContextManager, counter TokenCounter, approvalStore *hitl.ApprovalStore) *ContextHandler {
 	return &ContextHandler{
 		messageStore:   messageStore,
 		contextManager: contextManager,
 		counter:        counter,
+		approvalStore:  approvalStore,
 	}
 }
 
@@ -335,6 +361,82 @@ func (h *ContextHandler) GetStats(c *gin.Context) {
 		MaxTokens:        config.MaxTokens,
 		MaxMessages:      config.MaxMessages,
 		SummaryThreshold: config.SummaryThreshold,
+	})
+}
+
+// GetHistory 获取指定线程的消息历史
+// GET /api/context/history?thread_id=xxx
+func (h *ContextHandler) GetHistory(c *gin.Context) {
+	threadID := c.Query("thread_id")
+	if threadID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
+			"code": "BAD_REQUEST", "message": "thread_id is required",
+		}})
+		return
+	}
+
+	messages, err := h.messageStore.Get(c.Request.Context(), threadID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{
+			"code": "INTERNAL_ERROR", "message": "failed to load messages",
+		}})
+		return
+	}
+
+	var raw []HistoryMessage
+	for _, msg := range messages {
+		if msg.Content == "" {
+			continue // 跳过空内容消息（如纯 tool_call 消息）
+		}
+		role := string(msg.Role)
+		// 跳过 tool 和 system 角色消息（不应出现在前端历史中，且会阻断 assistant 合并）
+		if role == "tool" || role == "system" {
+			continue
+		}
+		// 跳过系统内部 guidance 消息（[系统提示] 开头的 user 消息）
+		// 这是 HITL Resume 流程的内部状态，不应展示给用户
+		if role == "user" && strings.HasPrefix(msg.Content, "[系统提示]") {
+			continue
+		}
+		raw = append(raw, HistoryMessage{
+			Role:    role,
+			Content: msg.Content,
+		})
+	}
+
+	// 合并连续 assistant 消息：Supervisor 模式下 Host 路由文本和最终回答
+	// 都作为独立 assistant 消息存储，只保留最后一个（最终回答）
+	var history []HistoryMessage
+	for _, msg := range raw {
+		if len(history) > 0 && history[len(history)-1].Role == "assistant" && msg.Role == "assistant" {
+			history[len(history)-1] = msg // 覆盖为最新的
+		} else {
+			history = append(history, msg)
+		}
+	}
+
+	if history == nil {
+		history = []HistoryMessage{}
+	}
+
+
+	// 从 ApprovalStore 丰富中断元数据：如果当前线程有待审批的中断，
+	// 将 InterruptMeta 附加到最后一条 assistant 消息上，供前端恢复审批卡片
+	if h.approvalStore != nil {
+		if card, found := h.approvalStore.GetApproval(c.Request.Context(), threadID); found {
+			if len(history) > 0 && history[len(history)-1].Role == "assistant" {
+				history[len(history)-1].Interrupt = &InterruptMeta{
+					InterruptID: card.InterruptID,
+					ToolName:    card.ApprovalInfo.ToolName,
+					ToolInput:   card.ApprovalInfo.ToolInput,
+					RiskReason:  card.ApprovalInfo.RiskReason,
+				}
+			}
+		}
+	}
+	c.JSON(http.StatusOK, HistoryResponse{
+		ThreadID: threadID,
+		Messages: history,
 	})
 }
 

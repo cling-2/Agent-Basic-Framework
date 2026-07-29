@@ -58,12 +58,13 @@ flowchart TB
         T1["CalculatorTool"]
         T2["GrepFilesTool"]
         T3["HashComputeTool"]
+        T4["SendEmailTool"]
     end
 
     MW --> SA
     SA --> MA & SEA & AA & GA
     MA & SEA & AA & GA --> TN
-    TN --> TM --> T1 & T2 & T3
+    TN --> TM --> T1 & T2 & T3 & T4
 ```
 
 ## 业务流程设计
@@ -286,6 +287,7 @@ calculatorTool, err := utils.InferTool[CalculatorInput, CalculatorOutput](
 | `calculator` | 查询类 | 执行数学计算 | ✅ |
 | `grep_files` | 查询类 | 文件内容搜索 | ✅ |
 | `hash_compute` | 管理员类 | 哈希值计算 | 🚫 |
+| `send_email` | 管理员类 | 发送邮件 | 🚫 |
 
 ### ToolsNode 工具调度节点
 

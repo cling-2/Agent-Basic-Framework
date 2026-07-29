@@ -5,6 +5,12 @@ export interface LoginRequest {
   password: string
 }
 
+export interface RegisterRequest {
+  username: string
+  password: string
+  role: string
+}
+
 export interface LoginResponse {
   session_id: string
   expires_in: number
@@ -88,6 +94,15 @@ export interface ErrorResponse {
   error: ErrorDetail
 }
 
+// ---- Auth 过期回调 ----
+
+let onAuthExpired: ((msg: string) => void) | null = null
+
+/** 注册认证过期回调（App 层调用，过期时跳转登录页） */
+export function setOnAuthExpired(callback: (msg: string) => void) {
+  onAuthExpired = callback
+}
+
 // ---- Token 管理 ----
 
 const TOKEN_KEY = 'kingsoft_agent_session_id'
@@ -125,6 +140,13 @@ async function request<T>(
     const body = (await res.json().catch(() => null)) as ErrorResponse | null
     const code = body?.error?.code ?? 'UNKNOWN'
     const message = body?.error?.message ?? res.statusText
+
+    // 认证过期 → 清 token + 触发回调跳转登录页
+    if (res.status === 401 && (code === 'UNAUTHORIZED' || code === 'SESSION_EXPIRED')) {
+      clearToken()
+      onAuthExpired?.(message || '登录过期，请重新登录！')
+    }
+
     throw new ApiError(res.status, code, message)
   }
 
@@ -154,6 +176,19 @@ export function login(req: LoginRequest): Promise<LoginResponse> {
   })
 }
 
+/** 注册 */
+export function register(req: RegisterRequest): Promise<LoginResponse> {
+  return request<LoginResponse>('/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  })
+}
+
+/** 获取可选角色列表 */
+export function getRoles(): Promise<{ roles: Array<{ id: number; name: string; description: string }> }> {
+  return request('/api/auth/roles')
+}
+
 /** 登出 */
 export function logout(): Promise<{ message: string }> {
   return request<{ message: string }>('/api/auth/logout', {
@@ -169,6 +204,31 @@ export function getSession(): Promise<SessionInfo> {
 /** 查询当前用户可调用工具 (DOC-01) */
 export function getTools(): Promise<ToolsResponse> {
   return request<ToolsResponse>('/api/permissions/tools')
+}
+
+// ---- DOC-04: 上下文管理 API ----
+
+export interface HistoryInterruptMeta {
+  interrupt_id: string
+  tool_name: string
+  tool_input: string
+  risk_reason: string
+}
+
+export interface HistoryMessage {
+  role: string
+  content: string
+  interrupt?: HistoryInterruptMeta
+}
+
+export interface HistoryResponse {
+  thread_id: string
+  messages: HistoryMessage[]
+}
+
+/** 获取指定线程的消息历史 */
+export function getHistory(threadId: string): Promise<HistoryResponse> {
+  return request<HistoryResponse>(`/api/context/history?thread_id=${encodeURIComponent(threadId)}`)
 }
 
 // ---- DOC-02: Agent & 工具调用 API ----

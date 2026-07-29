@@ -1,10 +1,10 @@
 import { useState, useRef, useEffect } from 'react'
 import {
-  logout,
-  clearToken,
   getSession,
+  getHistory,
   decideCheckpointStream,
   chatStream,
+  listCheckpoints,
   type SessionInfo,
   type InterruptInfo,
   type StreamEvent,
@@ -12,7 +12,8 @@ import {
 import MarkdownRenderer from './MarkdownRenderer'
 
 interface ChatPageProps {
-  onLogout: () => void
+  threadId: string | null
+  onSessionTitleUpdate?: (id: string, title: string) => void
 }
 
 // 推理/工具步骤（DeepSeek 样式：灰色小字、单独段落、持久保留）
@@ -175,21 +176,81 @@ function createStreamEventHandler(
   }
 }
 
-export default function ChatPage({ onLogout }: ChatPageProps) {
+export default function ChatPage({ threadId, onSessionTitleUpdate }: ChatPageProps) {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [session, setSession] = useState<SessionInfo | null>(null)
-  const threadId = useRef(`thread_${Date.now()}`)
+  const [historyLoaded, setHistoryLoaded] = useState(false)
+  const threadIdRef = useRef(threadId || `thread_${Date.now()}`)
   const abortRef = useRef<(() => void) | null>(null)
 
   useEffect(() => {
     getSession().then(setSession).catch(() => {})
     return () => {
-      // 组件卸载时取消正在进行的流式请求
       abortRef.current?.()
     }
   }, [])
+
+  // 从后端加载消息历史
+  useEffect(() => {
+    if (!threadId) {
+      setHistoryLoaded(true)
+      return
+    }
+    setHistoryLoaded(false)
+    getHistory(threadId)
+      .then(res => {
+        const loaded: Message[] = res.messages
+          .filter(m => m.role === 'user' || m.role === 'assistant')
+          .map((m, i) => ({
+            id: `hist_${i}`,
+            role: m.role as 'user' | 'assistant',
+            content: m.content,
+            steps: [],
+            streamDone: true,
+            // 从历史中恢复中断状态
+            interrupt: m.interrupt ? {
+              interrupt_id: m.interrupt.interrupt_id,
+              tool_name: m.interrupt.tool_name,
+              tool_input: m.interrupt.tool_input,
+              risk_reason: m.interrupt.risk_reason,
+            } : undefined,
+          }))
+        setMessages(loaded)
+
+        // 兜底检查：如果历史中无中断但 ApprovalStore 仍有待审批卡片，追加中断消息
+        const hasInterrupt = loaded.some(m => m.interrupt)
+        if (!hasInterrupt) {
+          listCheckpoints()
+            .then(cpRes => {
+              const pending = cpRes.checkpoints.find(cp => cp.approval_info.thread_id === threadId)
+              if (pending) {
+                setMessages(prev => [...prev, {
+                  id: `interrupt_${Date.now()}`,
+                  role: 'assistant' as const,
+                  content: '⏸️ 操作需要人工审批，请在下方审批面板中确认。',
+                  steps: [],
+                  streamDone: true,
+                  interrupt: {
+                    interrupt_id: pending.interrupt_id,
+                    tool_name: pending.approval_info.tool_name,
+                    tool_input: pending.approval_info.tool_input,
+                    risk_reason: pending.approval_info.risk_reason,
+                  },
+                }])
+              }
+            })
+            .catch(() => {}) // 非关键，忽略错误
+        }
+      })
+      .catch(() => {
+        setMessages([])
+      })
+      .finally(() => {
+        setHistoryLoaded(true)
+      })
+  }, [threadId])
 
   const handleSend = async (text?: string) => {
     const msg = text || input.trim()
@@ -197,6 +258,11 @@ export default function ChatPage({ onLogout }: ChatPageProps) {
 
     setInput('')
     setLoading(true)
+
+    // 首次发送消息时，用消息内容更新会话标题
+    if (messages.length === 0 && onSessionTitleUpdate && threadId) {
+      onSessionTitleUpdate(threadId, msg.slice(0, 30) + (msg.length > 30 ? '...' : ''))
+    }
 
     const userMsg: Message = { id: `u_${Date.now()}`, role: 'user', content: msg, steps: [] }
     setMessages(prev => [...prev, userMsg])
@@ -214,7 +280,7 @@ export default function ChatPage({ onLogout }: ChatPageProps) {
     // 使用流式 SSE
     const handler = createStreamEventHandler(assistantId, setMessages, setLoading)
     const cancel = chatStream(
-      { thread_id: threadId.current, message: msg },
+      { thread_id: threadIdRef.current, message: msg },
       handler,
     )
     abortRef.current = cancel
@@ -247,46 +313,24 @@ export default function ChatPage({ onLogout }: ChatPageProps) {
     )
 
     const cancel = decideCheckpointStream(
-      threadId.current,
+      threadIdRef.current,
       { decision, comment: decision === 'reject' ? '操作被拒绝' : '' },
       handler,
     )
     abortRef.current = cancel
   }
 
-  const handleLogout = async () => {
-    try { await logout() } catch {}
-    clearToken()
-    onLogout()
-  }
-
-  const roleLabel = session?.role === 'admin' ? '管理员' : '访客'
-  const roleClass = session?.role === 'admin' ? 'role-admin' : 'role-visitor'
-
-  // 判断是否有正在进行的 thinking/tool/routing 步骤（需要显示加载动画）
-  // 条件：流未结束 + 最后一步是 thinking/tool_call/routing + 还没有答案内容
-  const isThinking = (msg: Message): boolean => {
-    if (msg.streamDone) return false
-    if (msg.content) return false  // 已有答案内容，思考完成
-    if (msg.steps.length === 0) return false
-    const last = msg.steps[msg.steps.length - 1]
-    return last?.type === 'thinking' || last?.type === 'tool_call' || last?.type === 'routing'
-  }
-
   return (
     <div className="chat-page">
-      {/* 顶栏 */}
-      <div className="chat-header">
-        <h2>💬 Kingsoft Agent</h2>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <span className={`role-tag ${roleClass}`}>{roleLabel}</span>
-          <button className="nav-settings-btn" onClick={handleLogout}>退出登录</button>
-        </div>
-      </div>
-
       {/* 消息区 */}
       <div className="chat-messages">
-        {messages.length === 0 && (
+        {!historyLoaded && (
+          <div className="chat-empty">
+            <div className="chat-empty-icon">⏳</div>
+            <h3>加载历史消息...</h3>
+          </div>
+        )}
+        {historyLoaded && messages.length === 0 && (
           <div className="chat-empty">
             <div className="chat-empty-icon">🤖</div>
             <h3>Kingsoft Agent 助手</h3>
@@ -305,99 +349,95 @@ export default function ChatPage({ onLogout }: ChatPageProps) {
           </div>
         )}
 
-        {messages.map(msg => (
-          <div key={msg.id} className={`chat-bubble ${msg.role} ${msg.isError ? 'bubble-error' : ''}`}>
-            {/* 头像 */}
-            <div className="bubble-avatar">
-              {msg.role === 'user' ? '👤' : '🤖'}
-            </div>
+        {messages.map(msg => {
+          // 判断是否有正在进行的 thinking/tool/routing 步骤
+          const isThinking = !msg.streamDone && !msg.content && msg.steps.length > 0 &&
+            ['thinking', 'tool_call', 'routing'].includes(msg.steps[msg.steps.length - 1]?.type || '')
 
-            {/* 气泡体 */}
-            <div className="bubble-body">
-              {/* 推理步骤链（DeepSeek 样式：灰色小字、单独段落、持久保留） */}
-              {msg.steps.length > 0 && (
-                <div className="bubble-steps">
-                  {msg.steps.map((step, i) => (
-                    <div key={i} className={`bubble-step bubble-step-${step.type}`}>
-                      {step.type === 'thinking' && (
-                        <span className="step-icon">💭</span>
-                      )}
-                      {step.type === 'routing' && (
-                        <span className="step-icon">🔀</span>
-                      )}
-                      {step.type === 'tool_call' && (
-                        <span className="step-icon">🔧</span>
-                      )}
-                      {step.type === 'tool_result' && (
-                        <span className="step-icon">✅</span>
-                      )}
-                      <span className="step-text">{step.content}</span>
-                      {step.tool && step.type === 'tool_call' && (
-                        <span className="step-tool-detail">{step.tool.name}</span>
-                      )}
-                      {/* 思考中/路由中的步骤加动画 */}
-                      {(step.type === 'thinking' || step.type === 'tool_call' || step.type === 'routing') && i === msg.steps.length - 1 && isThinking(msg) && (
-                        <span className="step-anim-dots">
-                          <span></span><span></span><span></span>
-                        </span>
-                      )}
+          return (
+            <div key={msg.id} className={`chat-bubble ${msg.role} ${msg.isError ? 'bubble-error' : ''}`}>
+              {/* 头像 */}
+              <div className="bubble-avatar">
+                {msg.role === 'user' ? '👤' : '🤖'}
+              </div>
+
+              {/* 气泡体 */}
+              <div className="bubble-body">
+                {/* 推理步骤链 */}
+                {msg.steps.length > 0 && (
+                  <div className="bubble-steps">
+                    {msg.steps.map((step, i) => (
+                      <div key={i} className={`bubble-step bubble-step-${step.type}`}>
+                        {step.type === 'thinking' && <span className="step-icon">💭</span>}
+                        {step.type === 'routing' && <span className="step-icon">🔀</span>}
+                        {step.type === 'tool_call' && <span className="step-icon">🔧</span>}
+                        {step.type === 'tool_result' && <span className="step-icon">✅</span>}
+                        <span className="step-text">{step.content}</span>
+                        {step.tool && step.type === 'tool_call' && (
+                          <span className="step-tool-detail">{step.tool.name}</span>
+                        )}
+                        {(step.type === 'thinking' || step.type === 'tool_call' || step.type === 'routing') && i === msg.steps.length - 1 && isThinking && (
+                          <span className="step-anim-dots">
+                            <span></span><span></span><span></span>
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                    {msg.content && msg.steps.length > 0 && (
+                      <div className="bubble-steps-divider"></div>
+                    )}
+                  </div>
+                )}
+
+                {/* 最终答案（中断消息只显示审批卡片，不显示文字内容） */}
+                {msg.content && !msg.interrupt ? (
+                  <div className="bubble-content">
+                    <MarkdownRenderer content={msg.content} />
+                  </div>
+                ) : null}
+
+                {/* 打字指示器 */}
+                {msg.role === 'assistant' && !msg.content && msg.steps.length === 0 && loading && (
+                  <div className="bubble-typing">
+                    <span></span><span></span><span></span>
+                  </div>
+                )}
+
+                {msg.isError && msg.content?.includes('权限不足') && (
+                  <div className="bubble-acl-note">
+                    ⚠️ ACLToolMiddleware 拦截：回灌拒绝信息，Agent 可自主调整策略
+                  </div>
+                )}
+                {msg.interrupt && (
+                  <div className="interrupt-card">
+                    <div className="interrupt-header">⏸️ 需要人工审批</div>
+                    <div className="interrupt-detail">
+                      <p><strong>工具：</strong>{msg.interrupt.tool_name}</p>
+                      <p><strong>输入：</strong>{msg.interrupt.tool_input}</p>
+                      <p><strong>原因：</strong>{msg.interrupt.risk_reason}</p>
                     </div>
-                  ))}
-                  {/* 步骤与最终答案之间用分割线 */}
-                  {msg.content && msg.steps.length > 0 && (
-                    <div className="bubble-steps-divider"></div>
-                  )}
-                </div>
-              )}
-
-              {/* 最终答案 */}
-              {msg.content ? (
-                <div className="bubble-content">
-                  <MarkdownRenderer content={msg.content} />
-                </div>
-              ) : null}
-
-              {/* 打字指示器（无内容且无步骤时） */}
-              {msg.role === 'assistant' && !msg.content && msg.steps.length === 0 && loading && (
-                <div className="bubble-typing">
-                  <span></span><span></span><span></span>
-                </div>
-              )}
-
-              {msg.isError && msg.content?.includes('权限不足') && (
-                <div className="bubble-acl-note">
-                  ⚠️ ACLToolMiddleware 拦截：回灌拒绝信息，Agent 可自主调整策略
-                </div>
-              )}
-              {msg.interrupt && (
-                <div className="interrupt-card">
-                  <div className="interrupt-header">⏸️ 需要人工审批</div>
-                  <div className="interrupt-detail">
-                    <p><strong>工具：</strong>{msg.interrupt.tool_name}</p>
-                    <p><strong>输入：</strong>{msg.interrupt.tool_input}</p>
-                    <p><strong>原因：</strong>{msg.interrupt.risk_reason}</p>
+                    <div className="interrupt-actions">
+                      <button
+                        className="btn-approve"
+                        onClick={() => handleDecision(msg.interrupt!, 'approve')}
+                        disabled={loading}
+                      >
+                        ✅ 批准
+                      </button>
+                      <button
+                        className="btn-reject"
+                        onClick={() => handleDecision(msg.interrupt!, 'reject')}
+                        disabled={loading}
+                      >
+                        ❌ 拒绝
+                      </button>
+                    </div>
                   </div>
-                  <div className="interrupt-actions">
-                    <button
-                      className="btn-approve"
-                      onClick={() => handleDecision(msg.interrupt!, 'approve')}
-                      disabled={loading}
-                    >
-                      ✅ 批准
-                    </button>
-                    <button
-                      className="btn-reject"
-                      onClick={() => handleDecision(msg.interrupt!, 'reject')}
-                      disabled={loading}
-                    >
-                      ❌ 拒绝
-                    </button>
-                  </div>
-                </div>
-              )}
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          )
+        })}
       </div>
 
       {/* 输入区 */}
