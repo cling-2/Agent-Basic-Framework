@@ -151,18 +151,19 @@ func BuildMemoryInjectionForUser(store MemoryStore, userID int64) []*MemoryEntry
 
 // SaveMemoryFromConversation 从对话中提取并保存长期记忆
 // 供 AgentHandler 后置调用，降级容错
-// extractor 不为 nil 时优先使用 LLM 提取，失败则回退到规则提取
+// extractor 不为 nil 时优先使用 LLM 提取（LLM 自己判断有无值得记住的信息，无需关键词触发）；
+// LLM 提取失败时回退到规则提取（此时需要 ShouldSaveMemory 关键词触发）
 func SaveMemoryFromConversation(store MemoryStore, userID int64, userMessage string, extractor MemoryExtractor) {
-	if !ShouldSaveMemory(userMessage) {
-		return
-	}
-
 	var entries []*MemoryEntry
-	if extractor != nil {
+	if extractor != nil && ShouldTryLLMExtraction(userMessage) {
+		// LLM 提取器可用时，尝试提取（LLM 会自行判断消息是否含值得记住的信息）
 		entries = extractor.Extract(context.Background(), userMessage)
 	}
-	// LLM 提取失败或无结果时，回退到规则提取
+	// LLM 提取失败或无结果时，回退到规则提取（需要触发关键词）
 	if len(entries) == 0 {
+		if !ShouldSaveMemory(userMessage) {
+			return
+		}
 		entries = ExtractMemoryFromConversation(userMessage)
 	}
 	for _, entry := range entries {

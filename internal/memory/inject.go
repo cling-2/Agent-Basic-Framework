@@ -88,10 +88,39 @@ func ShouldSaveMemory(userMessage string) bool {
 		"我叫", "我的名字", "记住", "别忘了",
 		"我姓", "我来自", "我住在", "我的邮箱",
 		"记住这", "以后记得", "我的是", "我的电话",
+		"我擅长", "我会", "我能", "我用", "我负责",
+		"我的工作", "我的职业", "我的公司", "我的项目",
+		"我正在", "我之前", "我平时", "我通常",
 	}
 	lower := strings.ToLower(userMessage)
 	for _, t := range triggers {
 		if strings.Contains(lower, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// ShouldTryLLMExtraction 轻量预筛：判断是否值得调用 LLM 进行记忆提取
+// 比规则触发宽松——只要包含第一人称陈述或信息量足够就有可能含可提取信息
+// 纯问句、极短消息等跳过，避免浪费 LLM 调用
+func ShouldTryLLMExtraction(userMessage string) bool {
+	// 极短消息不太可能含可提取信息
+	if len([]rune(userMessage)) < 4 {
+		return false
+	}
+	// 规则触发词直接通过
+	if ShouldSaveMemory(userMessage) {
+		return true
+	}
+	// 包含第一人称陈述标记（"我" + 动词/形容词）
+	firstPersonPatterns := []string{"我是", "我叫", "我姓", "我有", "我会", "我能",
+		"我擅长", "我喜欢", "我偏好", "我习惯", "我负责", "我用",
+		"我住", "我来自", "我的", "我之前", "我正在", "我平时",
+		"我通常", "我经常", "我总是", "我从不", "我不要"}
+	lower := strings.ToLower(userMessage)
+	for _, p := range firstPersonPatterns {
+		if strings.Contains(lower, p) {
 			return true
 		}
 	}
