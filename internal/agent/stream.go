@@ -356,6 +356,9 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 	userMsg := schema.UserMessage(message)
 	_ = h.messageStore.Append(ctx, threadID, userMsg)
 
+	// 设置线程所有权（首次写入时，用于数据隔离）
+	h.messageStore.SetOwner(ctx, threadID, uc.UserID)
+
 	var fullMessages []*schema.Message
 	if history != nil {
 		fullMessages = append(fullMessages, history...)
@@ -405,9 +408,9 @@ func (h *AgentHandler) ChatStream(c *gin.Context) {
 	interruptFromCallback := emitter.sentInterrupt
 	emitter.mu.Unlock()
 	if interruptFromCallback {
-		return
 		// 存储中断消息，确保历史恢复时能还原中断状态
 		h.storeInterruptMessages(ctx, threadID, collector)
+		return
 	}
 
 	if interruptInfo != nil {

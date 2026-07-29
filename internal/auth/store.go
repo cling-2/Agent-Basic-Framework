@@ -71,23 +71,26 @@ func (s *MemoryUserStore) Seed(roles []*model.Role, users []struct {
 	return nil
 }
 
-// GetByUsername 根据用户名查询用户
+// GetByUsername 根据用户名查询用户（返回防御性副本，防止外部修改内部状态）
 func (s *MemoryUserStore) GetByUsername(_ context.Context, username string) (*model.User, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	u, ok := s.byName[username]
 	if !ok {
 		return nil, ErrUserNotFound
-}
+	}
 
 	// 填充 RoleName
 	if role, ok := s.roles[u.RoleID]; ok {
 		u.RoleName = role.Name
 	}
-	return u, nil
+
+	// 返回防御性副本
+	copy := *u
+	return &copy, nil
 }
 
-// GetByID 根据ID查询用户
+// GetByID 根据ID查询用户（返回防御性副本，防止外部修改内部状态）
 func (s *MemoryUserStore) GetByID(_ context.Context, id int64) (*model.User, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -98,7 +101,10 @@ func (s *MemoryUserStore) GetByID(_ context.Context, id int64) (*model.User, err
 	if role, ok := s.roles[u.RoleID]; ok {
 		u.RoleName = role.Name
 	}
-	return u, nil
+
+	// 返回防御性副本
+	copy := *u
+	return &copy, nil
 }
 
 // GetRoleByID 根据ID查询角色

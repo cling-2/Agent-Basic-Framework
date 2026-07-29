@@ -36,7 +36,7 @@ type LoginRequest struct {
 type RegisterRequest struct {
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required"`
-	Role     string `json:"role" binding:"required"` // "admin" 或 "visitor"
+	// 注册时不允许选择角色，始终分配 visitor，防止提权攻击
 }
 
 // LoginResponse 登录响应
@@ -88,6 +88,7 @@ var (
 
 // Register 用户注册
 // POST /api/auth/register
+// 安全设计：注册时始终分配 visitor 角色，不允许自选 admin
 func (h *AuthHandler) Register(c *gin.Context) {
 	var req RegisterRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -95,19 +96,8 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		return
 	}
 
-	// 映射角色名到角色 ID
-	roleIDMap := map[string]int64{
-		model.RoleAdmin:   1,
-		model.RoleVisitor: 2,
-	}
-	roleID, ok := roleIDMap[req.Role]
-	if !ok {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: ErrorDetail{
-			Code:    "BAD_REQUEST",
-			Message: "invalid role, must be 'admin' or 'visitor'",
-		}})
-		return
-	}
+	// 注册固定分配 visitor 角色，防止提权攻击
+	roleID := int64(2) // visitor roleID
 
 	// 哈希密码
 	hash, err := hashPassword(req.Password)
@@ -151,9 +141,10 @@ func (h *AuthHandler) Register(c *gin.Context) {
 
 // GetRoles 查询可选角色列表
 // GET /api/auth/roles
+// 安全设计：注册时不再允许选择角色，此接口仅返回角色信息供展示
 func (h *AuthHandler) GetRoles(c *gin.Context) {
 	roles := []gin.H{
-		{ "id": 1, "name": model.RoleAdmin, "description": "管理员，可调用所有工具" },
+		{ "id": 1, "name": model.RoleAdmin, "description": "管理员，可调用所有工具（仅由系统预置）" },
 		{ "id": 2, "name": model.RoleVisitor, "description": "访客，仅可调用查询类工具" },
 	}
 	c.JSON(http.StatusOK, gin.H{"roles": roles})

@@ -57,22 +57,23 @@ func (s *MemorySessionStore) Create(_ context.Context, session *model.Session) e
 	})
 
 	if len(userSessions) >= model.MaxSessionsPerUser {
-		// 淘汰最早创建的会话
+		// 淘汰最早创建的会话（copy-on-write：创建副本后修改，避免数据竞争）
 		sort.Slice(userSessions, func(i, j int) bool {
 			return userSessions[i].CreatedAt.Before(userSessions[j].CreatedAt)
 		})
 		oldest := userSessions[0]
 		now := timeNow()
-		oldest.Status = model.SessionRevoked
-		oldest.UpdatedAt = now
-		s.sessions.Store(oldest.SessionID, oldest)
+		revoked := *oldest // 副本
+		revoked.Status = model.SessionRevoked
+		revoked.UpdatedAt = now
+		s.sessions.Store(oldest.SessionID, &revoked)
 	}
 
 	s.sessions.Store(session.SessionID, session)
 	return nil
 }
 
-// Get 获取会话
+// Get 获取会话（返回防御性副本，防止调用方修改内部状态）
 func (s *MemorySessionStore) Get(_ context.Context, sessionID string) (*model.Session, error) {
 	val, ok := s.sessions.Load(sessionID)
 	if !ok {
@@ -89,16 +90,20 @@ func (s *MemorySessionStore) Get(_ context.Context, sessionID string) (*model.Se
 	// 检查是否超过有效期
 	now := timeNow()
 	if now.After(sess.ExpiresAt) {
-		sess.Status = model.SessionExpired
-		sess.UpdatedAt = now
-		s.sessions.Store(sessionID, sess)
+		// copy-on-write：创建副本后修改
+		expired := *sess
+		expired.Status = model.SessionExpired
+		expired.UpdatedAt = now
+		s.sessions.Store(sessionID, &expired)
 		return nil, ErrSessionExpired
 	}
 
-	return sess, nil
+	// 返回防御性副本
+	copy := *sess
+	return &copy, nil
 }
 
-// Delete 删除会话（主动登出）
+// Delete 删除会话（主动登出，copy-on-write）
 func (s *MemorySessionStore) Delete(_ context.Context, sessionID string) error {
 	val, ok := s.sessions.Load(sessionID)
 	if !ok {
@@ -106,13 +111,14 @@ func (s *MemorySessionStore) Delete(_ context.Context, sessionID string) error {
 	}
 
 	sess := val.(*model.Session)
-	sess.Status = model.SessionRevoked
-	sess.UpdatedAt = timeNow()
-	s.sessions.Store(sessionID, sess)
+	revoked := *sess // 副本
+	revoked.Status = model.SessionRevoked
+	revoked.UpdatedAt = timeNow()
+	s.sessions.Store(sessionID, &revoked)
 	return nil
 }
 
-// Renew 续期会话
+// Renew 续期会话（copy-on-write）
 func (s *MemorySessionStore) Renew(_ context.Context, sessionID string) error {
 	val, ok := s.sessions.Load(sessionID)
 	if !ok {
@@ -136,15 +142,18 @@ func (s *MemorySessionStore) Renew(_ context.Context, sessionID string) error {
 
 	// 已超过最大生命周期
 	if now.After(maxExpiry) {
-		sess.Status = model.SessionExpired
-		sess.UpdatedAt = now
-		s.sessions.Store(sessionID, sess)
+		expired := *sess // 副本
+		expired.Status = model.SessionExpired
+		expired.UpdatedAt = now
+		s.sessions.Store(sessionID, &expired)
 		return ErrSessionExpired
 	}
 
-	sess.ExpiresAt = newExpiry
-	sess.UpdatedAt = now
-	s.sessions.Store(sessionID, sess)
+	// copy-on-write：创建副本后修改
+	renewed := *sess
+	renewed.ExpiresAt = newExpiry
+	renewed.UpdatedAt = now
+	s.sessions.Store(sessionID, &renewed)
 	return nil
 }
 
@@ -169,15 +178,16 @@ func (s *MemorySessionStore) startCleanup() {
 	}()
 }
 
-// cleanExpired 清理过期会话
+// cleanExpired 清理过期会话（copy-on-write）
 func (s *MemorySessionStore) cleanExpired() {
 	now := timeNow()
 	s.sessions.Range(func(key, value interface{}) bool {
 		sess := value.(*model.Session)
 		if sess.Status == model.SessionActive && now.After(sess.ExpiresAt) {
-			sess.Status = model.SessionExpired
-			sess.UpdatedAt = now
-			s.sessions.Store(key, sess)
+			expired := *sess // 副本
+			expired.Status = model.SessionExpired
+			expired.UpdatedAt = now
+			s.sessions.Store(key, &expired)
 		}
 		return true
 	})

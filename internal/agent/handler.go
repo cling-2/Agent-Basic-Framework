@@ -176,6 +176,9 @@ func (h *AgentHandler) Chat(c *gin.Context) {
 	userMsg := schema.UserMessage(req.Message)
 	_ = h.messageStore.Append(ctx, req.ThreadID, userMsg) // 写入失败不影响当前
 
+	// 设置线程所有权（首次写入时，用于数据隔离）
+	h.messageStore.SetOwner(ctx, req.ThreadID, uc.UserID)
+
 	// 构造完整消息列表（用于 Process 输入）
 	var fullMessages []*schema.Message
 	if history != nil {
@@ -440,8 +443,29 @@ func (h *AgentHandler) Resume(c *gin.Context) {
 
 // ListCheckpoints 列出待审批检查点
 // GET /api/agent/checkpoints
+// 安全设计：仅返回当前用户自己的待审批卡片，管理员可查看所有
 func (h *AgentHandler) ListCheckpoints(c *gin.Context) {
+	uc, ok := pkgmodel.UserContextFromCtx(c.Request.Context())
+	if !ok {
+		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: ErrorDetail{
+			Code: "UNAUTHORIZED", Message: "session invalid or expired",
+		}})
+		return
+	}
+
 	approvals := h.approvalStore.ListApprovals(context.Background())
+
+	// 非 admin 用户只能看到自己的审批卡片
+	if uc.Role != pkgmodel.RoleAdmin {
+		var filtered []*hitl.InterruptCard
+		for _, card := range approvals {
+			if card.ApprovalInfo.UserID == uc.UserID {
+				filtered = append(filtered, card)
+			}
+		}
+		approvals = filtered
+	}
+
 	c.JSON(http.StatusOK, CheckpointsResponse{Checkpoints: approvals})
 }
 
@@ -564,17 +588,25 @@ func (h *AgentHandler) specialistNameSet() map[string]bool {
 // ---------- 流式审批恢复 ----------
 
 // ResumeStream 流式审批恢复处理
-// GET /api/agent/checkpoint/:thread_id/decide/stream?decision=approve/reject&comment=xxx
+// POST /api/agent/checkpoint/:thread_id/decide/stream
 // 使用 Stream() + SSE Callback 实现流式恢复，让前端能看到恢复后的工具执行步骤和结果
+// 安全设计：使用 POST + JSON body 传递决策，避免 GET 方法导致的 CSRF 风险
 func (h *AgentHandler) ResumeStream(c *gin.Context) {
 	threadID := c.Param("thread_id")
-	decision := c.Query("decision")
-	comment := c.Query("comment")
 
-	if decision != hitl.DecisionApprove && decision != hitl.DecisionReject {
+	var req ResumeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: errBadRequest})
 		return
 	}
+
+	if req.Decision != hitl.DecisionApprove && req.Decision != hitl.DecisionReject {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: errBadRequest})
+		return
+	}
+
+	decision := req.Decision
+	comment := req.Comment
 
 	// 验证 UserContext
 	uc, ok := pkgmodel.UserContextFromCtx(c.Request.Context())
@@ -703,17 +735,20 @@ func (h *AgentHandler) ResumeStream(c *gin.Context) {
 	// 消费主输出流
 	finalMessage, interruptInfo, recvErr := consumeStreamWithInterrupt(stream)
 
-	// 如果 OnError 回调已经发射了 interrupt+done，直接返回
+	// 如果 OnError 回调已经发射了 interrupt+done，存储中断消息后直接返回
 	emitter.mu.Lock()
 	interruptFromCallback := emitter.sentInterrupt
 	emitter.mu.Unlock()
 	if interruptFromCallback {
+		// 存储中断消息，确保历史恢复时能还原中断状态
+		h.storeInterruptMessages(resumeCtx, threadID, collector)
 		return
 	}
 
 	// 检查新的中断
 	if interruptInfo != nil {
 		log.Printf("[SSE/Resume] 检测到新HITL中断(Recv): contexts=%d", len(interruptInfo.InterruptContexts))
+		h.storeInterruptMessages(resumeCtx, threadID, collector)
 		h.streamHandleInterrupt(c, interruptInfo, threadID)
 		return
 	}

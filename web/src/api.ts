@@ -8,7 +8,7 @@ export interface LoginRequest {
 export interface RegisterRequest {
   username: string
   password: string
-  role: string
+  // 注册时不再允许选择角色，后端固定分配 visitor
 }
 
 export interface LoginResponse {
@@ -176,7 +176,7 @@ export function login(req: LoginRequest): Promise<LoginResponse> {
   })
 }
 
-/** 注册 */
+/** 注册（固定分配 visitor 角色） */
 export function register(req: RegisterRequest): Promise<LoginResponse> {
   return request<LoginResponse>('/api/auth/register', {
     method: 'POST',
@@ -311,6 +311,7 @@ export function decideCheckpoint(threadId: string, req: ResumeRequest): Promise<
 /**
  * 流式审批决策 —— 通过 SSE 接收实时恢复事件
  * 审批后 Agent 继续执行，步骤和结果通过 SSE 事件回传
+ * 安全设计：使用 POST + JSON body 传递决策，避免 CSRF 风险
  */
 export function decideCheckpointStream(
   threadId: string,
@@ -318,22 +319,26 @@ export function decideCheckpointStream(
   onEvent: StreamEventHandler,
 ): () => void {
   const token = loadToken()
-  const params = new URLSearchParams({
-    decision: req.decision,
-    ...(req.comment ? { comment: req.comment } : {}),
-  })
-  const url = `/api/agent/checkpoint/${encodeURIComponent(threadId)}/decide/stream?${params}`
+  // 使用 POST 方法 + JSON body，而非 GET + query 参数
+  const url = `/api/agent/checkpoint/${encodeURIComponent(threadId)}/decide/stream`
 
   const controller = new AbortController()
 
   ;(async () => {
     try {
-      const headers: Record<string, string> = {}
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      }
       if (token) {
         headers['Authorization'] = `Bearer ${token}`
       }
 
-      const resp = await fetch(url, { headers, signal: controller.signal })
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ decision: req.decision, comment: req.comment || '' }),
+        signal: controller.signal,
+      })
 
       if (!resp.ok) {
         onEvent({ type: 'error', content: `请求失败: ${resp.status}` })
