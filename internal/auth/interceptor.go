@@ -1,12 +1,5 @@
 package auth
 
-import (
-	"context"
-	"fmt"
-
-	"kingsoft-agent/pkg/model"
-)
-
 // ToolCall 工具调用请求（与 Eino 框架对接时替换为实际类型）
 type ToolCall struct {
 	Name string                 `json:"name"`
@@ -32,12 +25,12 @@ type ToolResult struct {
 // 		if !ok {
 // 			return nil, fmt.Errorf("user context not found in request")
 // 		}
-
+//
 // 		allowed, err := acl.Allowed(ctx, uc.Role, toolCall.Name, "execute")
 // 		if err != nil {
 // 			return nil, fmt.Errorf("ACL check failed: %w", err)
 // 		}
-
+//
 // 		if !allowed {
 // 			// 回灌：不抛异常中断，而是返回结构化拒绝信息
 // 			return &ToolResult{
@@ -48,7 +41,7 @@ type ToolResult struct {
 // 				IsError: true,
 // 			}, nil
 // 		}
-
+//
 // 		// 有权限，继续执行
 // 		return nil, nil
 // 	}

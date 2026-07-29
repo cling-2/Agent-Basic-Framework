@@ -23,7 +23,7 @@ type LLMConfig struct {
 	Model       string // 模型名称，由用户补充（如 gpt-4o、qwen-plus 等）
 	HeaderName  string // 自定义HTTP Header名（如 ksyun-code-type）
 	HeaderValue string // 自定义HTTP Header值（业务标识）
-	MaxRetries  int           // 429最大重试次数（0表示使用默认值3，-1表示不重试）
+	MaxRetries  int           // 429最大重试次数（0表示使用默认值5，-1表示不重试）
 	InitialBackoff time.Duration // 初始退避时长（默认1s）
 	MaxBackoff    time.Duration // 最大退避时长（默认30s）
 }

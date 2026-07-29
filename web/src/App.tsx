@@ -196,7 +196,9 @@ export default function App() {
           <ChatPage
             key={activeSessionId || 'empty'}
             threadId={activeSessionId}
+            sessionTitle={sessions.find(s => s.id === activeSessionId)?.title}
             onSessionTitleUpdate={(id, title) => handleRenameSession(id, title)}
+            onSessionDelete={(id) => handleDeleteSession(id)}
           />
         </main>
       </div>

@@ -13,7 +13,9 @@ import MarkdownRenderer from './MarkdownRenderer'
 
 interface ChatPageProps {
   threadId: string | null
+  sessionTitle?: string
   onSessionTitleUpdate?: (id: string, title: string) => void
+  onSessionDelete?: (id: string) => void
 }
 
 // 推理/工具步骤（DeepSeek 样式：灰色小字、单独段落、持久保留）
@@ -176,12 +178,13 @@ function createStreamEventHandler(
   }
 }
 
-export default function ChatPage({ threadId, onSessionTitleUpdate }: ChatPageProps) {
+export default function ChatPage({ threadId, sessionTitle, onSessionTitleUpdate, onSessionDelete }: ChatPageProps) {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [session, setSession] = useState<SessionInfo | null>(null)
   const [historyLoaded, setHistoryLoaded] = useState(false)
+  const [staleSession, setStaleSession] = useState(false) // 服务器重启后会话数据丢失
   const threadIdRef = useRef(threadId || `thread_${Date.now()}`)
   const abortRef = useRef<(() => void) | null>(null)
 
@@ -218,6 +221,11 @@ export default function ChatPage({ threadId, onSessionTitleUpdate }: ChatPagePro
             } : undefined,
           }))
         setMessages(loaded)
+
+        // 如果后端返回空历史，且会话标题不是"新会话"（说明之前有过对话但服务器重启后数据丢失）
+        if (loaded.length === 0 && res.messages.length === 0 && sessionTitle && sessionTitle !== '新会话') {
+          setStaleSession(true)
+        }
 
         // 兜底检查：如果历史中无中断但 ApprovalStore 仍有待审批卡片，追加中断消息
         const hasInterrupt = loaded.some(m => m.interrupt)
@@ -330,7 +338,25 @@ export default function ChatPage({ threadId, onSessionTitleUpdate }: ChatPagePro
             <h3>加载历史消息...</h3>
           </div>
         )}
-        {historyLoaded && messages.length === 0 && (
+        {historyLoaded && messages.length === 0 && staleSession && (
+          <div className="chat-empty">
+            <div className="chat-empty-icon">⚠️</div>
+            <h3>会话数据已丢失</h3>
+            <div className="chat-empty-hint">
+              服务器重启后历史消息不可恢复，建议删除此会话并创建新会话
+            </div>
+            {onSessionDelete && threadId && (
+              <button
+                className="btn-approve"
+                style={{ marginTop: 12, background: '#ef4444' }}
+                onClick={() => onSessionDelete(threadId)}
+              >
+                🗑️ 删除此会话
+              </button>
+            )}
+          </div>
+        )}
+        {historyLoaded && messages.length === 0 && !staleSession && (
           <div className="chat-empty">
             <div className="chat-empty-icon">🤖</div>
             <h3>Kingsoft Agent 助手</h3>
