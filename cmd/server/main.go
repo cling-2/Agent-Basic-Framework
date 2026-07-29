@@ -97,10 +97,6 @@ func main() {
 			ToolNames:    []string{"hash_compute", "send_email"},
 		},
 		{
-			Name:         "GeneralAgent",
-			IntendedUse:  "处理日常对话、知识问答等通用任务",
-			SystemPrompt: "你是一个通用问答助手。直接回答用户问题，不需要使用工具。",
-			ToolNames:    []string{},
 		},
 	}
 
