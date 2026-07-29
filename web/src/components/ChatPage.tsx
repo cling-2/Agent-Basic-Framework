@@ -44,7 +44,7 @@ const QUICK_PROMPTS = [
   { label: '🔢 计算 2+3*4', message: '计算2+3*4' },
   { label: '📄 搜索文件 TODO', message: 'grep TODO' },
   { label: '🔐 计算SHA256', message: '计算 hello 的SHA256哈希' },
-  { label: '📧 发送邮件', message: '发送一封邮件' },
+  { label: '📧 发送邮件', message: '发送一封邮件。主题：项目进展 正文：目前进展不错。 发送给alice@example.com' },
 ]
 
 // 处理 SSE 流事件的通用逻辑
@@ -202,62 +202,108 @@ export default function ChatPage({ threadId, sessionTitle, onSessionTitleUpdate,
       return
     }
     setHistoryLoaded(false)
-    getHistory(threadId)
-      .then(res => {
-        const loaded: Message[] = res.messages
-          .filter(m => m.role === 'user' || m.role === 'assistant')
-          .map((m, i) => ({
-            id: `hist_${i}`,
-            role: m.role as 'user' | 'assistant',
-            content: m.content,
-            steps: [],
-            streamDone: true,
-            // 从历史中恢复中断状态
-            interrupt: m.interrupt ? {
-              interrupt_id: m.interrupt.interrupt_id,
-              tool_name: m.interrupt.tool_name,
-              tool_input: m.interrupt.tool_input,
-              risk_reason: m.interrupt.risk_reason,
-            } : undefined,
-          }))
-        setMessages(loaded)
+    setStaleSession(false)
 
-        // 如果后端返回空历史，且会话标题不是"新会话"（说明之前有过对话但服务器重启后数据丢失）
-        if (loaded.length === 0 && res.messages.length === 0 && sessionTitle && sessionTitle !== '新会话') {
-          setStaleSession(true)
-        }
+    let pollTimer: ReturnType<typeof setTimeout> | null = null
+    let cancelled = false
 
-        // 兜底检查：如果历史中无中断但 ApprovalStore 仍有待审批卡片，追加中断消息
-        const hasInterrupt = loaded.some(m => m.interrupt)
-        if (!hasInterrupt) {
-          listCheckpoints()
-            .then(cpRes => {
-              const pending = cpRes.checkpoints.find(cp => cp.approval_info.thread_id === threadId)
-              if (pending) {
-                setMessages(prev => [...prev, {
-                  id: `interrupt_${Date.now()}`,
-                  role: 'assistant' as const,
-                  content: '⏸️ 操作需要人工审批，请在下方审批面板中确认。',
-                  steps: [],
-                  streamDone: true,
-                  interrupt: {
-                    interrupt_id: pending.interrupt_id,
-                    tool_name: pending.approval_info.tool_name,
-                    tool_input: pending.approval_info.tool_input,
-                    risk_reason: pending.approval_info.risk_reason,
-                  },
-                }])
-              }
-            })
-            .catch(() => {}) // 非关键，忽略错误
-        }
-      })
-      .catch(() => {
-        setMessages([])
-      })
-      .finally(() => {
-        setHistoryLoaded(true)
-      })
+    function loadHistory() {
+      getHistory(threadId!)
+        .then(res => {
+          if (cancelled) return
+          const loaded: Message[] = res.messages
+            .filter(m => m.role === 'user' || m.role === 'assistant')
+            .map((m, i) => ({
+              id: `hist_${i}`,
+              role: m.role as 'user' | 'assistant',
+              content: m.content,
+              steps: [],
+              streamDone: true,
+              // 从历史中恢复中断状态
+              interrupt: m.interrupt ? {
+                interrupt_id: m.interrupt.interrupt_id,
+                tool_name: m.interrupt.tool_name,
+                tool_input: m.interrupt.tool_input,
+                risk_reason: m.interrupt.risk_reason,
+              } : undefined,
+            }))
+          // setMessages 延迟到轮询检测之后执行（轮询分支需追加思考占位消息）
+
+          // 如果后端返回空历史，且会话标题不是"新会话"（说明之前有过对话但服务器重启后数据丢失）
+          if (loaded.length === 0 && res.messages.length === 0 && sessionTitle && sessionTitle !== '新会话') {
+            setStaleSession(true)
+          }
+
+          // 兜底检查：如果历史中无中断但 ApprovalStore 仍有待审批卡片，追加中断消息
+          const hasInterrupt = loaded.some(m => m.interrupt)
+          if (!hasInterrupt) {
+            listCheckpoints()
+              .then(cpRes => {
+                if (cancelled) return
+                const pending = cpRes.checkpoints.find(cp => cp.approval_info.thread_id === threadId)
+                if (pending) {
+                  setMessages(prev => [...prev, {
+                    id: `interrupt_${Date.now()}`,
+                    role: 'assistant' as const,
+                    content: '⏸️ 操作需要人工审批，请在下方审批面板中确认。',
+                    steps: [],
+                    streamDone: true,
+                    interrupt: {
+                      interrupt_id: pending.interrupt_id,
+                      tool_name: pending.approval_info.tool_name,
+                      tool_input: pending.approval_info.tool_input,
+                      risk_reason: pending.approval_info.risk_reason,
+                    },
+                  }])
+                }
+              })
+              .catch(() => {}) // 非关键，忽略错误
+          }
+
+          // 检测是否有未完成的对话：需要继续轮询的情况：
+          //   a) 最后一条是 user 消息（agent 还没开始回复）
+          //   b) 最后一条是 assistant 但是合成的中断消息（审批尚未处理）
+          // 只有真正的最终回复出现时才停止轮询
+          const lastMsg = loaded.length > 0 ? loaded[loaded.length - 1]! : null
+          const isPendingResponse =
+            // 最后是 user 消息（agent 还在处理）
+            (lastMsg?.role === 'user') ||
+            // 最后是中断消息（审批尚未决定）
+            (lastMsg?.role === 'assistant' && lastMsg.content.startsWith('⏸️')) ||
+            // 最后是中断且有审批卡片（审批尚未决定）
+            (lastMsg?.role === 'assistant' && lastMsg.interrupt != null)
+
+          if (isPendingResponse) {
+            setLoading(true)
+            // 在消息末尾追加"思考中"占位消息，让用户看到 agent 正在工作
+            setMessages([...loaded, {
+              id: 'thinking_placeholder',
+              role: 'assistant' as const,
+              content: '',
+              steps: [{ type: 'thinking', content: '正在思考...' }],
+              streamDone: false,
+            }])
+            pollTimer = setTimeout(loadHistory, 2000) // 2 秒后再次加载
+          } else {
+            setLoading(false) // 真正的最终回复已到，停止轮询
+            setMessages(loaded)
+          }
+        })
+        .catch(() => {
+          if (cancelled) return
+          setMessages([])
+        })
+        .finally(() => {
+          if (!cancelled) setHistoryLoaded(true)
+        })
+    }
+
+    loadHistory()
+
+    return () => {
+      cancelled = true
+      if (pollTimer) clearTimeout(pollTimer)
+    }
   }, [threadId])
 
   const handleSend = async (text?: string) => {
