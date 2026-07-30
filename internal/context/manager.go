@@ -315,9 +315,10 @@ func NewContextHandler(messageStore MessageStore, contextManager ContextManager,
 }
 
 // GetStats 查询当前线程上下文统计（GET /api/context/stats?thread_id=xxx）
+// 安全设计：验证线程所有权，用户只能查询自己的线程统计
 func (h *ContextHandler) GetStats(c *gin.Context) {
 	// 验证身份
-	_, ok := pkgmodel.UserContextFromCtx(c.Request.Context())
+	uc, ok := pkgmodel.UserContextFromCtx(c.Request.Context())
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{
 			"code": "UNAUTHORIZED", "message": "session invalid or expired",
@@ -331,6 +332,17 @@ func (h *ContextHandler) GetStats(c *gin.Context) {
 			"code": "BAD_REQUEST", "message": "thread_id is required",
 		}})
 		return
+	}
+
+	// 数据隔离校验：非 admin 用户只能查询自己的线程
+	if uc.Role != pkgmodel.RoleAdmin {
+		owner, hasOwner := h.messageStore.GetOwner(c.Request.Context(), threadID)
+		if hasOwner && owner != uc.UserID {
+			c.JSON(http.StatusForbidden, gin.H{"error": gin.H{
+				"code": "FORBIDDEN", "message": "you do not have access to this thread",
+			}})
+			return
+		}
 	}
 
 	// 加载消息
@@ -366,13 +378,34 @@ func (h *ContextHandler) GetStats(c *gin.Context) {
 
 // GetHistory 获取指定线程的消息历史
 // GET /api/context/history?thread_id=xxx
+// 安全设计：验证线程所有权，用户只能访问自己的对话历史
 func (h *ContextHandler) GetHistory(c *gin.Context) {
+	// 验证身份
+	uc, ok := pkgmodel.UserContextFromCtx(c.Request.Context())
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{
+			"code": "UNAUTHORIZED", "message": "session invalid or expired",
+		}})
+		return
+	}
+
 	threadID := c.Query("thread_id")
 	if threadID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
 			"code": "BAD_REQUEST", "message": "thread_id is required",
 		}})
 		return
+	}
+
+	// 数据隔离校验：非 admin 用户只能访问自己的线程
+	if uc.Role != pkgmodel.RoleAdmin {
+		owner, hasOwner := h.messageStore.GetOwner(c.Request.Context(), threadID)
+		if hasOwner && owner != uc.UserID {
+			c.JSON(http.StatusForbidden, gin.H{"error": gin.H{
+				"code": "FORBIDDEN", "message": "you do not have access to this thread",
+			}})
+			return
+		}
 	}
 
 	messages, err := h.messageStore.Get(c.Request.Context(), threadID)

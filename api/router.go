@@ -39,9 +39,9 @@ func SetupRoutes(
 		// Agent 对话接口
 		authorized.POST("/agent/chat", agentHandler.Chat)
 		authorized.GET("/agent/chat/stream", agentHandler.ChatStream)
-		// HITL 审批接口
+		// HITL 审批接口（ResumeStream 使用 POST，避免 CSRF 风险）
 		authorized.POST("/agent/checkpoint/:thread_id/decide", agentHandler.Resume)
-		authorized.GET("/agent/checkpoint/:thread_id/decide/stream", agentHandler.ResumeStream)
+		authorized.POST("/agent/checkpoint/:thread_id/decide/stream", agentHandler.ResumeStream)
 		authorized.GET("/agent/checkpoints", agentHandler.ListCheckpoints)
 		// 管理端接口（admin 权限在 handler 内校验）
 		authorized.GET("/tools", agentHandler.ListTools)

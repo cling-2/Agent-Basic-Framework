@@ -112,8 +112,8 @@ func (m *MockChatModel) routeToSpecialist(msg string) *schema.Message {
 		return m.makeToolCall("SearchAgent", fmt.Sprintf(`{"message":"%s"}`, msg))
 	}
 
-	// 默认 → GeneralAgent（日常对话、知识问答等）
-	return m.makeToolCall("GeneralAgent", fmt.Sprintf(`{"message":"%s"}`, msg))
+	// 默认 → Host 直接回答（不做 Specialist 路由）
+	return m.generateGeneralReply(msg)
 }
 
 // ---------- ReAct 模式工具选择 ----------

@@ -187,6 +187,12 @@ export default function ChatPage({ threadId, sessionTitle, onSessionTitleUpdate,
   const [staleSession, setStaleSession] = useState(false) // 服务器重启后会话数据丢失
   const threadIdRef = useRef(threadId || `thread_${Date.now()}`)
   const abortRef = useRef<(() => void) | null>(null)
+  const messagesEndRef = useRef<HTMLDivElement>(null) // 自动滚动锚点
+
+  // 自动滚动到底部：消息变化或流式更新时触发
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
 
   useEffect(() => {
     getSession().then(setSession).catch(() => {})
@@ -510,6 +516,8 @@ export default function ChatPage({ threadId, sessionTitle, onSessionTitleUpdate,
             </div>
           )
         })}
+        {/* 自动滚动锚点 */}
+        <div ref={messagesEndRef} />
       </div>
 
       {/* 输入区 */}

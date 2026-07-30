@@ -1,36 +1,17 @@
-import { useState, useEffect } from 'react'
-import { login, register, getRoles, saveToken, ApiError } from '../api'
+import { useState } from 'react'
+import { login, register, saveToken, ApiError } from '../api'
 
 interface LoginProps {
   onSuccess: () => void
   initialMessage?: string
 }
 
-interface RoleOption {
-  id: number
-  name: string
-  description: string
-}
-
 export default function LoginPage({ onSuccess, initialMessage }: LoginProps) {
   const [mode, setMode] = useState<'login' | 'register'>('login')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
-  const [role, setRole] = useState('visitor')
-  const [roles, setRoles] = useState<RoleOption[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(initialMessage || '')
-
-  // 加载可选角色列表
-  useEffect(() => {
-    getRoles().then(res => setRoles(res.roles)).catch(() => {
-      // fallback
-      setRoles([
-        { id: 1, name: 'admin', description: '管理员，可调用所有工具' },
-        { id: 2, name: 'visitor', description: '访客，仅可调用查询类工具' },
-      ])
-    })
-  }, [])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -42,7 +23,8 @@ export default function LoginPage({ onSuccess, initialMessage }: LoginProps) {
       if (mode === 'login') {
         res = await login({ username, password })
       } else {
-        res = await register({ username, password, role })
+        // 注册时不再选择角色，后端固定分配 visitor
+        res = await register({ username, password })
       }
       saveToken(res.session_id)
       onSuccess()
@@ -105,27 +87,13 @@ export default function LoginPage({ onSuccess, initialMessage }: LoginProps) {
             />
           </div>
 
-          {/* 注册时选择角色 */}
+          {/* 注册时提示角色为访客 */}
           {mode === 'register' && (
             <div className="form-group">
-              <label>用户类型</label>
-              <div className="role-select-group">
-                {roles.map(r => (
-                  <label key={r.id} className={`role-select-item ${role === r.name ? 'role-select-active' : ''}`}>
-                    <input
-                      type="radio"
-                      name="role"
-                      value={r.name}
-                      checked={role === r.name}
-                      onChange={() => setRole(r.name)}
-                    />
-                    <div className="role-select-content">
-                      <span className="role-select-name">{r.name === 'admin' ? '🔑 管理员' : '👤 访客'}</span>
-                      <span className="role-select-desc">{r.description}</span>
-                    </div>
-                  </label>
-                ))}
-              </div>
+              <p style={{ color: '#6b7280', fontSize: '0.85rem', margin: 0 }}>
+                注册用户默认为 <strong>访客</strong> 角色，可使用计算器和文件搜索工具。
+                如需管理员权限，请联系管理员。
+              </p>
             </div>
           )}
 
@@ -146,17 +114,6 @@ export default function LoginPage({ onSuccess, initialMessage }: LoginProps) {
             <span>已有账号？<button onClick={toggleMode}>返回登录</button></span>
           )}
         </div>
-
-        {mode === 'login' && (
-          <div className="login-hint">
-            <p>预设账号：</p>
-            <code>admin / admin123</code>
-            <span>（管理员，全部工具权限）</span>
-            <br />
-            <code>visitor / visitor123</code>
-            <span>（访客，仅查询类工具）</span>
-          </div>
-        )}
       </div>
     </div>
   )

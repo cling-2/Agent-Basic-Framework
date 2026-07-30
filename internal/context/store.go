@@ -19,6 +19,12 @@ type MessageStore interface {
 
 	// Clear 清除指定线程的消息历史
 	Clear(ctx stdctx.Context, threadID string) error
+
+	// SetOwner 设置线程所属用户（首次写入时调用，用于数据隔离校验）
+	SetOwner(ctx stdctx.Context, threadID string, userID int64) error
+
+	// GetOwner 获取线程所属用户 ID，未设置返回 (0, false)
+	GetOwner(ctx stdctx.Context, threadID string) (int64, bool)
 }
 
 // MemoryMessageStore 内存版消息历史存储
@@ -26,12 +32,14 @@ type MessageStore interface {
 type MemoryMessageStore struct {
 	mu       sync.RWMutex
 	messages map[string][]*schema.Message // threadID → 消息列表
+	owners   map[string]int64             // threadID → userID（数据隔离）
 }
 
 // NewMemoryMessageStore 创建内存版消息历史存储
 func NewMemoryMessageStore() *MemoryMessageStore {
 	return &MemoryMessageStore{
 		messages: make(map[string][]*schema.Message),
+		owners:   make(map[string]int64),
 	}
 }
 
@@ -61,5 +69,22 @@ func (s *MemoryMessageStore) Clear(ctx stdctx.Context, threadID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.messages, threadID)
+	delete(s.owners, threadID)
 	return nil
+}
+
+// SetOwner 设置线程所属用户（用于数据隔离校验）
+func (s *MemoryMessageStore) SetOwner(_ stdctx.Context, threadID string, userID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.owners[threadID] = userID
+	return nil
+}
+
+// GetOwner 获取线程所属用户 ID
+func (s *MemoryMessageStore) GetOwner(_ stdctx.Context, threadID string) (int64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	id, ok := s.owners[threadID]
+	return id, ok
 }

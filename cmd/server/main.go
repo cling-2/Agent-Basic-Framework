@@ -96,12 +96,6 @@ func main() {
 			SystemPrompt: "你是一个管理员工具助手。你拥有 hash_compute 和 send_email 两个工具。\n\n重要规则：\n- 你必须通过调用工具完成任务，不要仅用文字描述操作\n- 当用户要求发送邮件时，必须调用 send_email 工具（传入 to、subject、body 参数），系统自动处理审批\n- 当用户要求计算哈希时，必须调用 hash_compute 工具\n- 调用工具后，将工具返回的具体结果完整呈现在回复中（如哈希值、邮件状态等）\n- 绝对不要只回复\"我来发送邮件\"或\"我来计算哈希\"而不实际调用工具\n\n示例：\n用户：发送邮件给 alice@example.com，主题：项目进展\n正确操作：调用 send_email(to=\"alice@example.com\", subject=\"项目进展\", body=\"...\")\n错误操作：回复\"好的，我来为您发送邮件\"（❌ 没有调用工具）\n\n用户：计算 hello 的 SHA256\n正确操作：调用 hash_compute(text=\"hello\", algorithm=\"sha256\")，然后回复\"hello 的 SHA256 哈希值为 2cf24dba5fb0a30e26e83b2ac5b9e29e...\"\n错误操作：回复\"我来帮你计算哈希\"（❌ 没有调用工具，没有给出哈希值）",
 			ToolNames:    []string{"hash_compute", "send_email"},
 		},
-		{
-			Name:         "GeneralAgent",
-			IntendedUse:  "处理日常对话、知识问答等通用任务",
-			SystemPrompt: "你是一个通用问答助手。直接回答用户问题，不需要使用工具。",
-			ToolNames:    []string{},
-		},
 	}
 
 	// 8. 构建专家 Agent 和 Supervisor
@@ -201,7 +195,6 @@ func main() {
 
 	addr := ":8080"
 	fmt.Printf("Kingsoft Agent Framework starting on %s\n", addr)
-	fmt.Println("Preset accounts: admin/admin123, visitor/visitor123")
 	fmt.Printf("Registered tools: %v\n", registry.Names())
 	fmt.Printf("Specialist agents: %v\n", agentDefNames(specialistDefs))
 	fmt.Printf("LLM configured: %v\n", settingsStore.IsConfigured())
