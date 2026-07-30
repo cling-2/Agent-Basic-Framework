@@ -142,7 +142,7 @@ func (h *MemoryHandler) DeleteMemory(c *gin.Context) {
 // 供 AgentHandler 调用
 func BuildMemoryInjectionForUser(store MemoryStore, userID int64) []*MemoryEntry {
 	// 使用 context.Background()，降级容错
-	entries, err := store.List(nil, userID, "")
+	entries, err := store.List(context.Background(), userID, "")
 	if err != nil || entries == nil {
 		return nil
 	}
@@ -168,6 +168,6 @@ func SaveMemoryFromConversation(store MemoryStore, userID int64, userMessage str
 	}
 	for _, entry := range entries {
 		entry.UserID = userID
-		_ = store.Put(nil, userID, entry) // 降级：写入失败不影响对话
+		_ = store.Put(context.Background(), userID, entry) // 降级：写入失败不影响对话
 	}
 }

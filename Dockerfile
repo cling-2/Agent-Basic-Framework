@@ -14,7 +14,7 @@ COPY web/ ./
 RUN npm run build
 
 # ===== Stage 2: 构建后端 =====
-FROM docker.1ms.run/golang:1.22-alpine AS backend
+FROM docker.1ms.run/golang:1.24-alpine AS backend
 
 # 使用国内 Go 模块代理
 ENV GOPROXY=https://goproxy.cn,direct
