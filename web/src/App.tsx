@@ -170,7 +170,7 @@ export default function App() {
             >
               ☰
             </button>
-            <span className="nav-brand">🤖 Kingsoft Agent</span>
+            <span className="nav-brand">Kingsoft Agent</span>
           </div>
           <div className="nav-right">
             <span className={`role-tag ${session?.role === 'admin' ? 'role-admin' : 'role-visitor'}`}>
