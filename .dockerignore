@@ -1,0 +1,31 @@
+# 二进制文件
+*.exe
+server
+kingsoft-agent
+
+# 前端依赖和构建产物（构建时重新生成）
+web/node_modules/
+web/dist/
+
+# 运行时数据（包含 API Key，不应打入镜像）
+data/
+
+# Git
+.git/
+.gitignore
+
+# IDE 和工具
+.idea/
+.vscode/
+.claude/
+.history/
+.superpowers/
+
+# 测试和文档
+coverage.out
+frontend_prompt.md
+
+# Docker 自身
+Dockerfile
+docker-compose.yml
+.dockerignore
