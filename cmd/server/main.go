@@ -195,7 +195,6 @@ func main() {
 
 	addr := ":8080"
 	fmt.Printf("Kingsoft Agent Framework starting on %s\n", addr)
-	fmt.Println("Preset accounts: admin/admin123, visitor/visitor123")
 	fmt.Printf("Registered tools: %v\n", registry.Names())
 	fmt.Printf("Specialist agents: %v\n", agentDefNames(specialistDefs))
 	fmt.Printf("LLM configured: %v\n", settingsStore.IsConfigured())

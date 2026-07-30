@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { login, register, saveToken, ApiError } from '../api'
 
 interface LoginProps {
@@ -114,17 +114,6 @@ export default function LoginPage({ onSuccess, initialMessage }: LoginProps) {
             <span>已有账号？<button onClick={toggleMode}>返回登录</button></span>
           )}
         </div>
-
-        {mode === 'login' && (
-          <div className="login-hint">
-            <p>预设账号：</p>
-            <code>admin / admin123</code>
-            <span>（管理员，全部工具权限）</span>
-            <br />
-            <code>visitor / visitor123</code>
-            <span>（访客，仅查询类工具）</span>
-          </div>
-        )}
       </div>
     </div>
   )
