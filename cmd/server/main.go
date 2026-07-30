@@ -21,6 +21,7 @@ import (
 	einomodel "github.com/cloudwego/eino/components/model"
 	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -28,8 +29,38 @@ func main() {
 
 	// 1. 初始化存储
 	userStore := auth.NewMemoryUserStore()
-	sessionStore := auth.NewMemorySessionStore()
+
+	// 初始化 Redis 客户端
+	redisAddr := firstNonEmpty(os.Getenv("REDIS_ADDR"), "localhost:6379")
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     redisAddr,
+		Password: "", // 无密码
+		DB:       0,  // 默认数据库
+	})
+	// 验证 Redis 连接
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Printf("warning: Redis connection failed (%v), using in-memory stores", err)
+		rdb = nil // 降级：Redis 不可用时使用内存存储
+	} else {
+		log.Printf("Redis connected: %s", redisAddr)
+	}
+
+	// 根据 Redis 可用性选择存储实现
+	var sessionStore auth.SessionStore
+	var messageStore ctxmgr.MessageStore
+	var memoryStore memory.MemoryStore
+
+	if rdb != nil {
+		sessionStore = auth.NewRedisSessionStore(rdb)
+		messageStore = ctxmgr.NewRedisMessageStore(rdb)
+		memoryStore = memory.NewRedisMemoryStore(rdb)
+	} else {
+		sessionStore = auth.NewMemorySessionStore()
+		messageStore = ctxmgr.NewMemoryMessageStore()
+		memoryStore = memory.NewInMemoryMemoryStore()
+	}
 	defer sessionStore.Close()
+
 	aclChecker := auth.NewMemoryACLChecker()
 
 	// 2. 初始化工具注册中心
@@ -121,8 +152,7 @@ func main() {
 		"发送邮件属于高风险操作，需要人工审批",
 	)
 
-	// 10. 创建上下文管理组件
-	messageStore := ctxmgr.NewMemoryMessageStore()
+	// 10. 创建上下文管理组件（使用已初始化的 messageStore）
 
 	// ContextManager 使用同一个 chatModel（ToolCallingChatModel 满足 BaseChatModel 接口）
 	var baseChatModel einomodel.BaseChatModel = chatModel
@@ -136,8 +166,7 @@ func main() {
 	tokenCounter := &ctxmgr.DefaultTokenCounter{}
 	contextHandler := ctxmgr.NewContextHandler(messageStore, contextManager, tokenCounter, approvalStore)
 
-	// 11. 创建长期记忆组件
-	memoryStore := memory.NewInMemoryMemoryStore()
+	// 11. 创建长期记忆组件（使用已初始化的 memoryStore）
 	memoryHandler := memory.NewMemoryHandler(memoryStore)
 	memoryExtractor := memory.NewLLMMemoryExtractor(baseChatModel)
 

@@ -2,57 +2,44 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // ========== 数据模型 ==========
 
 // MemoryEntry 长期记忆条目
-// 以 key-value 形式存储用户画像、偏好和事实
-// 按 userId 隔离，同一用户下 key 唯一
 type MemoryEntry struct {
-	ID        int64     `json:"id"`         // 条目 ID（自增）
-	UserID    int64     `json:"user_id"`    // 归属用户 ID（命名空间）
-	Key       string    `json:"key"`        // 条目键（如 "preference_language"）
-	Value     string    `json:"value"`      // 条目值（如 "Python"）
-	Category  string    `json:"category"`   // 分类（preference / fact / rule）
-	CreatedAt time.Time `json:"created_at"` // 创建时间
-	UpdatedAt time.Time `json:"updated_at"` // 最后更新时间
+	ID        int64     `json:"id"`
+	UserID    int64     `json:"user_id"`
+	Key       string    `json:"key"`
+	Value     string    `json:"value"`
+	Category  string    `json:"category"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // ========== MemoryStore 接口 ==========
 
 // MemoryStore 长期记忆存储接口
-// 按 userId 隔离，存储用户画像、偏好和事实
-// 内存版与持久化版可平滑切换，业务代码无需改动
 type MemoryStore interface {
-	// Put 写入或更新一条长期记忆
-	// 同一 userId + key 下，新值覆盖旧值
 	Put(ctx context.Context, userID int64, entry *MemoryEntry) error
-
-	// Get 获取指定用户的指定 key 的长期记忆
-	// 不存在返回 nil, nil（空记忆不是错误）
 	Get(ctx context.Context, userID int64, key string) (*MemoryEntry, error)
-
-	// List 列出指定用户的所有长期记忆条目
-	// 按 category 过滤（空字符串表示不过滤）
 	List(ctx context.Context, userID int64, category string) ([]*MemoryEntry, error)
-
-	// Delete 删除指定用户的指定 key 的长期记忆
 	Delete(ctx context.Context, userID int64, key string) error
 }
 
-// ========== InMemoryMemoryStore 实现 ==========
+// ========== InMemoryMemoryStore 内存实现 ==========
 
 // InMemoryMemoryStore 内存版长期记忆存储
-// 基于 sync.RWMutex + map，进程内存储，重启丢失
-// 无需任何外部依赖即可运行
 type InMemoryMemoryStore struct {
 	mu      sync.RWMutex
 	entries map[string]*MemoryEntry // key: "{userID}:{entryKey}" → MemoryEntry
-	nextID  int64                   // 自增 ID 生成器
+	nextID  int64
 }
 
 // NewInMemoryMemoryStore 创建内存版长期记忆存储
@@ -68,8 +55,6 @@ func storageKey(userID int64, key string) string {
 	return fmt.Sprintf("%d:%s", userID, key)
 }
 
-// Put 写入或更新一条长期记忆
-// 同一 userId + key 下，新值覆盖旧值
 func (s *InMemoryMemoryStore) Put(_ context.Context, userID int64, entry *MemoryEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -78,12 +63,10 @@ func (s *InMemoryMemoryStore) Put(_ context.Context, userID int64, entry *Memory
 	now := time.Now()
 
 	if existing, ok := s.entries[sk]; ok {
-		// 覆盖更新
 		existing.Value = entry.Value
 		existing.Category = entry.Category
 		existing.UpdatedAt = now
 	} else {
-		// 新增
 		s.entries[sk] = &MemoryEntry{
 			ID:        s.nextID,
 			UserID:    userID,
@@ -99,8 +82,6 @@ func (s *InMemoryMemoryStore) Put(_ context.Context, userID int64, entry *Memory
 	return nil
 }
 
-// Get 获取指定用户的指定 key 的长期记忆
-// 不存在返回 nil, nil（空记忆不是错误）
 func (s *InMemoryMemoryStore) Get(_ context.Context, userID int64, key string) (*MemoryEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -110,13 +91,10 @@ func (s *InMemoryMemoryStore) Get(_ context.Context, userID int64, key string) (
 	if !ok {
 		return nil, nil
 	}
-	// 返回副本
 	cp := *entry
 	return &cp, nil
 }
 
-// List 列出指定用户的所有长期记忆条目
-// 按 category 过滤（空字符串表示不过滤）
 func (s *InMemoryMemoryStore) List(_ context.Context, userID int64, category string) ([]*MemoryEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -125,15 +103,12 @@ func (s *InMemoryMemoryStore) List(_ context.Context, userID int64, category str
 	var result []*MemoryEntry
 
 	for sk, entry := range s.entries {
-		// 过滤：前缀匹配 userId
 		if len(sk) < len(prefix) || sk[:len(prefix)] != prefix {
 			continue
 		}
-		// 过滤：category 匹配
 		if category != "" && entry.Category != category {
 			continue
 		}
-		// 返回副本
 		cp := *entry
 		result = append(result, &cp)
 	}
@@ -141,12 +116,143 @@ func (s *InMemoryMemoryStore) List(_ context.Context, userID int64, category str
 	return result, nil
 }
 
-// Delete 删除指定用户的指定 key 的长期记忆
 func (s *InMemoryMemoryStore) Delete(_ context.Context, userID int64, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	sk := storageKey(userID, key)
 	delete(s.entries, sk)
+	return nil
+}
+
+// ========== RedisMemoryStore 持久化实现 ==========
+
+const (
+	memoryKeyPrefix = "memory:"       // Hash: userID → {entryKey: JSON}
+	memoryIDKey     = "memory:next_id" // String: 自增 ID 计数器
+)
+
+// RedisMemoryStore 基于 Redis 的持久化长期记忆存储
+// Redis 优势：
+//   - Hash 结构天然支持按 userID + entryKey 的 upsert 操作
+//   - 持久化（AOF/RDB），重启不丢失
+//   - 支持分布式部署
+type RedisMemoryStore struct {
+	client *redis.Client
+}
+
+// NewRedisMemoryStore 创建 Redis 持久化长期记忆存储
+func NewRedisMemoryStore(client *redis.Client) *RedisMemoryStore {
+	return &RedisMemoryStore{client: client}
+}
+
+// memoryHashKey 生成用户记忆 Hash 的 Redis Key
+func memoryHashKey(userID int64) string {
+	return fmt.Sprintf("%s%d", memoryKeyPrefix, userID)
+}
+
+// Put 写入或更新一条长期记忆
+func (s *RedisMemoryStore) Put(ctx context.Context, userID int64, entry *MemoryEntry) error {
+	hashKey := memoryHashKey(userID)
+	now := time.Now()
+
+	// 检查是否已存在
+	existingData, err := s.client.HGet(ctx, hashKey, entry.Key).Result()
+	var newEntry MemoryEntry
+	if err == nil && existingData != "" {
+		// 已存在，覆盖更新
+		if err := json.Unmarshal([]byte(existingData), &newEntry); err != nil {
+			// 数据损坏，重新创建
+			newEntry.ID, _ = s.client.Incr(ctx, memoryIDKey).Result()
+		}
+		newEntry.Value = entry.Value
+		newEntry.Category = entry.Category
+		newEntry.UpdatedAt = now
+	} else {
+		// 新增
+		newEntry = MemoryEntry{
+			ID:        0, // 会在下面设置
+			UserID:    userID,
+			Key:       entry.Key,
+			Value:     entry.Value,
+			Category:  entry.Category,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		id, err := s.client.Incr(ctx, memoryIDKey).Result()
+		if err != nil {
+			return fmt.Errorf("生成记忆ID失败: %w", err)
+		}
+		newEntry.ID = id
+	}
+
+	data, err := json.Marshal(&newEntry)
+	if err != nil {
+		return fmt.Errorf("序列化记忆条目失败: %w", err)
+	}
+
+	// HSET: Hash 中以 entryKey 为 field
+	if err := s.client.HSet(ctx, hashKey, entry.Key, data).Err(); err != nil {
+		return fmt.Errorf("存储记忆条目失败: %w", err)
+	}
+
+	return nil
+}
+
+// Get 获取指定用户的指定 key 的长期记忆
+func (s *RedisMemoryStore) Get(ctx context.Context, userID int64, key string) (*MemoryEntry, error) {
+	hashKey := memoryHashKey(userID)
+	data, err := s.client.HGet(ctx, hashKey, key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil // 不存在
+		}
+		return nil, fmt.Errorf("查询记忆条目失败: %w", err)
+	}
+
+	var entry MemoryEntry
+	if err := json.Unmarshal([]byte(data), &entry); err != nil {
+		return nil, fmt.Errorf("解析记忆条目失败: %w", err)
+	}
+
+	return &entry, nil
+}
+
+// List 列出指定用户的所有长期记忆条目
+func (s *RedisMemoryStore) List(ctx context.Context, userID int64, category string) ([]*MemoryEntry, error) {
+	hashKey := memoryHashKey(userID)
+
+	// 获取 Hash 中所有 field-value
+	result, err := s.client.HGetAll(ctx, hashKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("查询记忆列表失败: %w", err)
+	}
+
+	if len(result) == 0 {
+		return nil, nil
+	}
+
+	var entries []*MemoryEntry
+	for _, data := range result {
+		var entry MemoryEntry
+		if err := json.Unmarshal([]byte(data), &entry); err != nil {
+			continue // 跳过损坏的条目
+		}
+		// 按 category 过滤
+		if category != "" && entry.Category != category {
+			continue
+		}
+		entries = append(entries, &entry)
+	}
+
+	return entries, nil
+}
+
+// Delete 删除指定用户的指定 key 的长期记忆
+func (s *RedisMemoryStore) Delete(ctx context.Context, userID int64, key string) error {
+	hashKey := memoryHashKey(userID)
+	if err := s.client.HDel(ctx, hashKey, key).Err(); err != nil {
+		return fmt.Errorf("删除记忆条目失败: %w", err)
+	}
 	return nil
 }
