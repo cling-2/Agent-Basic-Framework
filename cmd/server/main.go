@@ -49,17 +49,21 @@ func main() {
 	var sessionStore auth.SessionStore
 	var messageStore ctxmgr.MessageStore
 	var memoryStore memory.MemoryStore
+	var approvalStore hitl.ApprovalStore
 
 	if rdb != nil {
 		sessionStore = auth.NewRedisSessionStore(rdb)
 		messageStore = ctxmgr.NewRedisMessageStore(rdb)
 		memoryStore = memory.NewRedisMemoryStore(rdb)
+		approvalStore = hitl.NewRedisApprovalStore(rdb)
 	} else {
 		sessionStore = auth.NewMemorySessionStore()
 		messageStore = ctxmgr.NewMemoryMessageStore()
 		memoryStore = memory.NewInMemoryMemoryStore()
+		approvalStore = hitl.NewMemoryApprovalStore()
 	}
 	defer sessionStore.Close()
+	defer approvalStore.Close()
 
 	aclChecker := auth.NewMemoryACLChecker()
 
@@ -103,8 +107,6 @@ func main() {
 	// 6.5 创建 HITL 中断-恢复组件
 	riskChecker := hitl.NewMemoryRiskChecker()
 	riskChecker.Add("send_email", "发送邮件属于高风险操作，需要人工审批")
-	approvalStore := hitl.NewApprovalStore()
-	defer approvalStore.Close()
 	hitlMiddleware := hitl.HumanApprovalMiddleware(riskChecker, approvalStore)
 
 	// 7. 创建专家 Agent 定义
