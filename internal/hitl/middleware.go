@@ -65,7 +65,7 @@ func GetOriginalMessage(ctx context.Context) string {
 //
 // 中间件链顺序：ACLToolMiddleware → HumanApprovalMiddleware → Tool 执行
 // 先过权限关再过审批关，ACL 不通过则不进入审批流程
-func HumanApprovalMiddleware(riskChecker RiskChecker, approvalStore *ApprovalStore) compose.ToolMiddleware {
+func HumanApprovalMiddleware(riskChecker RiskChecker, approvalStore ApprovalStore) compose.ToolMiddleware {
 	return compose.ToolMiddleware{
 		Invokable: func(next compose.InvokableToolEndpoint) compose.InvokableToolEndpoint {
 			return func(ctx context.Context, input *compose.ToolInput) (*compose.ToolOutput, error) {

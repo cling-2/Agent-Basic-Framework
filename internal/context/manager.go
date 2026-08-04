@@ -301,11 +301,11 @@ type ContextHandler struct {
 	messageStore   MessageStore
 	contextManager ContextManager
 	counter        TokenCounter
-	approvalStore  *hitl.ApprovalStore // 用于 GetHistory 中断元数据丰富
+	approvalStore  hitl.ApprovalStore // 用于 GetHistory 中断元数据丰富
 }
 
 // NewContextHandler 创建上下文管理 HTTP 处理器
-func NewContextHandler(messageStore MessageStore, contextManager ContextManager, counter TokenCounter, approvalStore *hitl.ApprovalStore) *ContextHandler {
+func NewContextHandler(messageStore MessageStore, contextManager ContextManager, counter TokenCounter, approvalStore hitl.ApprovalStore) *ContextHandler {
 	return &ContextHandler{
 		messageStore:   messageStore,
 		contextManager: contextManager,
@@ -456,7 +456,7 @@ func (h *ContextHandler) GetHistory(c *gin.Context) {
 	// 从 ApprovalStore 丰富中断元数据：如果当前线程有待审批的中断，
 	// 将 InterruptMeta 附加到最后一条 assistant 消息上，供前端恢复审批卡片
 	if h.approvalStore != nil {
-		if card, found := h.approvalStore.GetApproval(c.Request.Context(), threadID); found {
+		if card := h.approvalStore.GetApproval(c.Request.Context(), threadID); card != nil {
 			if len(history) > 0 && history[len(history)-1].Role == "assistant" {
 				history[len(history)-1].Interrupt = &InterruptMeta{
 					InterruptID: card.InterruptID,

@@ -215,7 +215,7 @@ export default function ChatPage({ threadId, sessionTitle, onSessionTitleUpdate,
 
     function loadHistory() {
       getHistory(threadId!)
-        .then(res => {
+        .then(async res => {
           if (cancelled) return
           const loaded: Message[] = res.messages
             .filter(m => m.role === 'user' || m.role === 'assistant')
@@ -233,7 +233,6 @@ export default function ChatPage({ threadId, sessionTitle, onSessionTitleUpdate,
                 risk_reason: m.interrupt.risk_reason,
               } : undefined,
             }))
-          // setMessages 延迟到轮询检测之后执行（轮询分支需追加思考占位消息）
 
           // 如果后端返回空历史，且会话标题不是"新会话"（说明之前有过对话但服务器重启后数据丢失）
           if (loaded.length === 0 && res.messages.length === 0 && sessionTitle && sessionTitle !== '新会话') {
@@ -241,45 +240,46 @@ export default function ChatPage({ threadId, sessionTitle, onSessionTitleUpdate,
           }
 
           // 兜底检查：如果历史中无中断但 ApprovalStore 仍有待审批卡片，追加中断消息
-          const hasInterrupt = loaded.some(m => m.interrupt)
+          // 使用 await 同步化，确保在决策之前 hasInterrupt 状态已确定
+          let hasInterrupt = loaded.some(m => m.interrupt)
           if (!hasInterrupt) {
-            listCheckpoints()
-              .then(cpRes => {
-                if (cancelled) return
-                const pending = cpRes.checkpoints.find(cp => cp.approval_info.thread_id === threadId)
-                if (pending) {
-                  setMessages(prev => [...prev, {
-                    id: `interrupt_${Date.now()}`,
-                    role: 'assistant' as const,
-                    content: '⏸️ 操作需要人工审批，请在下方审批面板中确认。',
-                    steps: [],
-                    streamDone: true,
-                    interrupt: {
-                      interrupt_id: pending.interrupt_id,
-                      tool_name: pending.approval_info.tool_name,
-                      tool_input: pending.approval_info.tool_input,
-                      risk_reason: pending.approval_info.risk_reason,
-                    },
-                  }])
-                }
-              })
-              .catch(() => {}) // 非关键，忽略错误
+            try {
+              const cpRes = await listCheckpoints()
+              if (cancelled) return
+              const pending = cpRes.checkpoints.find(cp => cp.approval_info.thread_id === threadId)
+              if (pending) {
+                hasInterrupt = true
+                loaded.push({
+                  id: `interrupt_${Date.now()}`,
+                  role: 'assistant' as const,
+                  content: '⏸️ 操作需要人工审批，请在下方审批面板中确认。',
+                  steps: [],
+                  streamDone: true,
+                  interrupt: {
+                    interrupt_id: pending.interrupt_id,
+                    tool_name: pending.approval_info.tool_name,
+                    tool_input: pending.approval_info.tool_input,
+                    risk_reason: pending.approval_info.risk_reason,
+                  },
+                })
+              }
+            } catch {
+              // 非关键，忽略错误
+            }
           }
 
-          // 检测是否有未完成的对话：需要继续轮询的情况：
-          //   a) 最后一条是 user 消息（agent 还没开始回复）
-          //   b) 最后一条是 assistant 但是合成的中断消息（审批尚未处理）
-          // 只有真正的最终回复出现时才停止轮询
+          // 三分支决策：中断优先 → Agent 仍在处理 → 对话正常结束
+          // 关键区分：中断 = Agent 暂停等待用户操作（不轮询、不设置 loading）；
+          //           待处理 = Agent 仍在运行（需要轮询、显示思考占位）
           const lastMsg = loaded.length > 0 ? loaded[loaded.length - 1]! : null
-          const isPendingResponse =
-            // 最后是 user 消息（agent 还在处理）
-            (lastMsg?.role === 'user') ||
-            // 最后是中断消息（审批尚未决定）
-            (lastMsg?.role === 'assistant' && lastMsg.content.startsWith('⏸️')) ||
-            // 最后是中断且有审批卡片（审批尚未决定）
-            (lastMsg?.role === 'assistant' && lastMsg.interrupt != null)
 
-          if (isPendingResponse) {
+          if (hasInterrupt) {
+            // 有待审批的中断：Agent 已暂停，等待用户操作
+            // 不设置 loading（确保审批按钮可点击），不追加思考占位消息，不启动轮询
+            setLoading(false)
+            setMessages(loaded)
+          } else if (lastMsg?.role === 'user') {
+            // Agent 仍在处理中，尚未回复
             setLoading(true)
             // 在消息末尾追加"思考中"占位消息，让用户看到 agent 正在工作
             setMessages([...loaded, {
@@ -291,7 +291,8 @@ export default function ChatPage({ threadId, sessionTitle, onSessionTitleUpdate,
             }])
             pollTimer = setTimeout(loadHistory, 2000) // 2 秒后再次加载
           } else {
-            setLoading(false) // 真正的最终回复已到，停止轮询
+            // 正常的最终回复已到，停止轮询
+            setLoading(false)
             setMessages(loaded)
           }
         })

@@ -298,8 +298,14 @@ func (e *SSEEmitter) BuildCallback() callbacks.Handler {
 // storeInterruptMessages 存储中断前已收集的消息和合成中断消息
 // 用于历史恢复时还原中断状态（前端切换会话后重新加载历史时，能看到中断卡片）
 func (h *AgentHandler) storeInterruptMessages(ctx context.Context, threadID string, collector *MessageCollector) {
+	// 只存储有实际业务价值的消息（ToolCall + ToolResult），跳过纯 "thinking" 中间消息
+	// thinking 消息是 Agent 内部推理过程的中间产物，不应作为对话历史持久化
 	allMessages := collector.Messages()
 	for _, msg := range allMessages {
+		if msg.Role == schema.Assistant && len(msg.ToolCalls) == 0 && msg.Content != "" && msg.Content != "⏸️ 操作需要人工审批，请在下方审批面板中确认。" {
+			// 跳过纯文本 assistant 消息（thinking），只保留含 ToolCall 的消息
+			continue
+		}
 		_ = h.messageStore.Append(ctx, threadID, msg)
 	}
 	_ = h.messageStore.Append(ctx, threadID, schema.AssistantMessage("⏸️ 操作需要人工审批，请在下方审批面板中确认。", nil))

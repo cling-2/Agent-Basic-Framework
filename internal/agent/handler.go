@@ -99,7 +99,7 @@ type AgentHandler struct {
 	toolRegistry      *toolreg.ToolRegistry
 	aclChecker        auth.ACLChecker
 	agentDefs         []*SpecialistDef
-	approvalStore     *hitl.ApprovalStore
+	approvalStore     hitl.ApprovalStore
 	intentRiskChecker IntentRiskChecker // 意图风险兜底检查器
 	messageStore      ctxmgr.MessageStore
 	contextManager    ctxmgr.ContextManager
@@ -113,7 +113,7 @@ func NewAgentHandler(
 	toolRegistry *toolreg.ToolRegistry,
 	aclChecker auth.ACLChecker,
 	agentDefs []*SpecialistDef,
-	approvalStore *hitl.ApprovalStore,
+	approvalStore hitl.ApprovalStore,
 	intentRiskChecker IntentRiskChecker,
 	messageStore ctxmgr.MessageStore,
 	contextManager ctxmgr.ContextManager,
@@ -322,8 +322,8 @@ func (h *AgentHandler) Resume(c *gin.Context) {
 
 	// 获取待审批卡片（使用 context.Background()，不依赖请求 context）
 	bgCtx := context.Background()
-	card, found := h.approvalStore.GetApproval(bgCtx, threadID)
-	if !found {
+	card := h.approvalStore.GetApproval(bgCtx, threadID)
+	if card == nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: ErrorDetail{
 			Code: "NOT_FOUND", Message: "no pending approval found for this thread",
 		}})
@@ -388,8 +388,6 @@ func (h *AgentHandler) Resume(c *gin.Context) {
 	}
 
 	// 存储审批决策引导消息，确保历史中 assistant/user 交替出现
-	guidanceMsg := schema.UserMessage(guidance)
-	_ = h.messageStore.Append(resumeCtx, threadID, guidanceMsg)
 
 	// 上下文管理（恢复时也需裁剪，虽然通常只有 1 条消息会快速短路）
 	trimmed, processErr := h.contextManager.Process(resumeCtx, messages)
@@ -619,8 +617,8 @@ func (h *AgentHandler) ResumeStream(c *gin.Context) {
 
 	// 获取待审批卡片
 	bgCtx := context.Background()
-	card, found := h.approvalStore.GetApproval(bgCtx, threadID)
-	if !found {
+	card := h.approvalStore.GetApproval(bgCtx, threadID)
+	if card == nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: ErrorDetail{
 			Code: "NOT_FOUND", Message: "no pending approval found for this thread",
 		}})
@@ -694,8 +692,6 @@ func (h *AgentHandler) ResumeStream(c *gin.Context) {
 		schema.UserMessage(card.OriginalMessage + "\n\n" + guidance),
 	}
 	// 存储审批决策引导消息，确保历史中 assistant/user 交替出现
-	guidanceMsg := schema.UserMessage(guidance)
-	_ = h.messageStore.Append(resumeCtx, threadID, guidanceMsg)
 
 	// 上下文管理
 	trimmed, processErr := h.contextManager.Process(resumeCtx, messages)
