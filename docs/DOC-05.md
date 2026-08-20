@@ -10,62 +10,69 @@
 
 记忆分为两层，性质截然不同，不可混淆：
 
-- **短期记忆（Short-Term Memory）**——会话内的状态检查点。以"线程/会话"为粒度，保存 Agent 运行至某一时刻的完整状态（消息历史、中间变量、待执行节点等）。它让单次会话可中断、可恢复（与 DOC-03 配合），并能从崩溃中续跑，生命周期与会话绑定。
+- **短期记忆（Short-Term Memory）**——会话内的对话历史持久化。以"线程/会话"为粒度，由 `MessageStore` 存储完整消息历史（含用户消息、Agent 回复、ToolCall/ToolResult 中间消息），保证会话可续接、可中断恢复。生命周期与会话绑定，上下文管理（DOC-04）从中读取全量历史再裁剪。
 - **长期记忆（Long-Term Memory）**——跨会话持久化的用户画像、事实与规则。以"用户/命名空间"为粒度，在多次会话中持续沉淀对用户的认知。它让 Agent 具备"换个会话仍记得你"的个性化能力，生命周期远超单次会话。
 
+> **关于 CheckpointStore**：`internal/hitl/store.go` 中存在 `MemoryCheckpointStore` 预留实现（Eino `compose.CheckPointStore` + `CheckPointDeleter`），但因 Eino `react.NewAgent` / `host.NewMultiAgent` 未暴露 `WithCheckPointStore` 编译选项，**当前未接入任何 Agent Graph**。短期会话连续性实际由 `MessageStore`（完整消息历史）+ 节点重跑恢复语义（DOC-03）保障。CheckpointStore 预留给上游框架修复后切换。
+
 **设计原则**：
-1. **短期与长期分层抽象** — CheckpointStore（状态检查点）与 MemoryStore（事实条目）为两套独立接口，数据模型与生命周期截然不同，不可混用
-2. **复用 Eino CheckpointStore 接口** — 短期记忆直接实现 `compose.CheckPointStore`（Get/Set）+ `compose.CheckPointDeleter`（Delete），不自研检查点抽象
+1. **短期与长期分层抽象** — MessageStore（对话历史，短期）与 MemoryStore（事实条目，长期）为两套独立接口，数据模型与生命周期截然不同，不可混用
+2. **MessageStore 充当短期记忆** — 按 thread_id 存储完整消息历史，提供会话续接能力；上下文管理（DOC-04）从中读取全量历史再裁剪，裁剪版仅用于本次 LLM 调用不回写
 3. **userId 作为长期记忆命名空间** — 从 DOC-01 AuthContext 中获取 userId，从源头保障多用户隔离，此为隐私与安全红线
 4. **thread_id 作为短期隔离键** — 从请求参数中获取 thread_id，同一会话内多次调用可续接状态，不同会话互不干扰
-5. **存储后端可替换** — CheckpointStore 与 MemoryStore 均通过接口抽象，内存版与持久化版可平滑切换，业务代码无需改动
+5. **存储后端可替换** — MessageStore 与 MemoryStore 均通过接口抽象，内存版与 Redis 版可平滑切换，业务代码无需改动
 6. **复用前四个模块成果** — 身份校验、会话管理、ACL 拦截、中断恢复、上下文管理直接沿用，不重复造轮子
 
 ### 短期记忆 vs 长期记忆对比
 
-| 维度 | 短期记忆（CheckpointStore） | 长期记忆（MemoryStore） |
+| 维度 | 短期记忆（MessageStore） | 长期记忆（MemoryStore） |
 | ---- | --------------------------- | ----------------------- |
-| 数据性质 | 状态快照（二进制 blob） | 结构化事实条目（key-value） |
-| 隔离键 | thread_id | userId |
+| 数据性质 | 完整消息历史（schema.Message 列表） | 结构化事实条目（key-value） |
+| 隔离键 | thread_id + userId（所有权） | userId |
 | 生命周期 | 与会话绑定，会话结束可清理 | 跨会话持久，长期有效 |
-| 典型内容 | Eino Graph 运行状态、消息历史 | "用户喜欢简洁回答""用户是 Java 开发者" |
-| 存储粒度 | 按线程整体存取 | 按用户 + 键值对存取 |
-| 与 DOC-03 关系 | 为 HITL 中断-恢复提供状态持久化 | 独立于 HITL，纯用户画像 |
-| 与 DOC-04 关系 | 可被 ContextManager 引用为历史来源 | 注入到 LLM Prompt 作为个性化上下文 |
+| 典型内容 | 用户消息、Agent 回复、ToolCall/ToolResult | "用户喜欢简洁回答""用户是 Java 开发者" |
+| 存储粒度 | 按线程追加（Append），读取返回防御性副本 | 按用户 + 键值对存取 |
+| 与 DOC-03 关系 | 为 HITL 中断-恢复提供消息历史续接 | 独立于 HITL，纯用户画像 |
+| 与 DOC-04 关系 | ContextManager 从中读取全量历史再裁剪 | 注入到 LLM Prompt 作为个性化上下文 |
 
 ## 建设目标
 
 | 目标 | 说明 |
 | ---- | ---- |
-| CheckpointStore 实现 | 实现 Eino `compose.CheckPointStore`（Get/Set）+ `CheckPointDeleter`（Delete），按 thread_id 隔离，同一会话内可续接状态 |
+| 短期记忆（MessageStore） | MessageStore 按 thread_id 存储完整消息历史，提供会话续接能力；含 SetOwner/GetOwner 实现线程所有权隔离 |
 | MemoryStore 实现 | 实现 `MemoryStore`（Put/Get/List/Delete），按 userId 存取用户画像与偏好事实 |
-| 内存版存储后端 | 提供 `InMemoryCheckpointStore` 与 `InMemoryMemoryStore` 两种默认实现，无需任何外部依赖即可运行 |
+| 内存版存储后端 | 提供 `MemoryMessageStore` 与 `InMemoryMemoryStore` 两种默认实现，无需任何外部依赖即可运行；Redis 版可平滑切换 |
+| CheckpointStore 预留 | `MemoryCheckpointStore` 已实现 Eino CheckPointStore + CheckPointDeleter 接口，但当前未接入（预留） |
 | 跨会话偏好演示 | 会话 A 中用户告知偏好并写入长期记忆，新建会话 B（不同 thread_id）可读取该偏好并据此回答 |
 | 多用户隔离 | userId 从 AuthContext 获取，thread_id 从请求参数获取，二者均由服务端控制，禁止前端直传 userId |
 
 ## 系统整体链路设计
 
 ```
-短期记忆（CheckpointStore）:
-  Agent 执行 → compose.WithCheckPointStore(store) → Eino Graph 引擎自动 Save/Load
-  → 按 thread_id 隔离存取 → 同一会话可续接状态
-  → 会话结束/过期 → CheckPointDeleter.Delete 清理
+短期记忆（MessageStore，会话对话历史）:
+  AgentHandler.Chat()
+    → MessageStore.Get(thread_id) 加载完整原始历史
+    → Append(thread_id, userMsg) 存储完整用户消息
+    → ContextManager.Process(全量历史) → 裁剪版仅用于本次 LLM 调用，不回写 Store
+    → Append(thread_id, agentReply) 存储完整 Agent 回复 + 中间 ToolCall/ToolResult 消息
+  → 会话续接：下次同 thread_id 请求可读取之前完整历史
+  → 多用户隔离：SetOwner/GetOwner 按 userId 校验线程归属
 
 长期记忆（MemoryStore）:
   用户消息 → AgentHandler.Chat()
-    → 从 MemoryStore.Get(userId) 加载该用户的长期记忆条目
+    → 从 MemoryStore.List(userId) 加载该用户的长期记忆条目
     → 注入到 LLM Prompt 的 system 区段（"关于此用户的已知信息：..."）
     → Agent 生成回复（可利用长期记忆进行个性化回答）
-    → 后置提取：从对话内容中提取新的用户偏好/事实
+    → 后置提取：LLM 优先 + 规则兜底，从对话内容中提取新的用户偏好/事实
     → MemoryStore.Put(userId, key, value) 写入/更新长期记忆
   → 跨会话：新 thread_id 共享同一 userId → 可读取之前的偏好
 ```
 
 **关键原则**：
-1. CheckpointStore 由 Eino Graph 引擎自动调用，业务代码不直接操作
-2. MemoryStore 由 AgentHandler 在 Chat/ChatStream 中调用，长期记忆注入 LLM Prompt 作为个性化上下文
+1. MessageStore（短期记忆）由 AgentHandler 在 Chat/ChatStream 中调用，存储完整对话历史；ContextManager 从中读取全量历史再裁剪，裁剪版不回写
+2. MemoryStore（长期记忆）由 AgentHandler 在 Chat/ChatStream 中调用，长期记忆注入 LLM Prompt 作为个性化上下文
 3. 长期记忆注入位置在 system 消息之后、用户消息之前，以"关于此用户的已知信息"格式呈现
-4. 长期记忆的提取目前采用显式写入策略（用户说"请记住我喜欢 Python"时触发写入），未来可扩展为 LLM 自动提取
+4. 长期记忆的提取采用 **LLM 优先 + 规则兜底** 策略：优先调用 `LLMMemoryExtractor`（复用项目 ChatModel）自动提取，通过 `ShouldTryLLMExtraction` 预过滤短消息以减少无效 LLM 调用；LLM 提取无结果或失败时回退到规则匹配。早期为"显式触发写入"思路，现已演进为 LLM 自动提取
 
 ## 整体架构设计
 
@@ -80,8 +87,8 @@ flowchart TB
     end
 
     subgraph MemoryLayer["记忆子系统"]
-        CS["CheckpointStore<br/>(Eino compose.CheckPointStore)"]
-        MS["MemoryStore<br/>(长期记忆: Put/Get/List/Delete)"]
+        MS_S["MessageStore<br/>(短期: 完整对话历史)"]
+        MS_L["MemoryStore<br/>(长期: Put/Get/List/Delete)"]
     end
 
     subgraph AgentLayer["Agent 编排层"]
@@ -93,14 +100,15 @@ flowchart TB
     end
 
     MW --> AH
-    AH -->|"1. 加载长期记忆"| MS
-    AH -->|"2. 注入到 Prompt"| RA
+    AH -->|"1. 加载对话历史"| MS_S
+    AH -->|"2. 加载长期记忆"| MS_L
+    AH -->|"3. 注入到 Prompt"| RA
     AH --> CM
-    RA -->|"3. Eino 自动 Save/Load"| CS
-    AH -->|"4. 后置写入长期记忆"| MS
+    AH -->|"4. 存对话历史(短期)"| MS_S
+    AH -->|"5. 后置写入长期记忆"| MS_L
 
-    style CS fill:#e0e7ff
-    style MS fill:#fef3c7
+    style MS_S fill:#e0e7ff
+    style MS_L fill:#fef3c7
 ```
 
 ## 业务流程设计
@@ -162,22 +170,22 @@ sequenceDiagram
     H-->>U: "根据您的偏好，我用 Python 为您编写排序脚本：\n```python\ndef bubble_sort(arr): ...\n```"
 ```
 
-### 3. 短期记忆（CheckpointStore）流程
+### 3. 短期记忆（MessageStore）流程
 
 ```mermaid
 sequenceDiagram
+    participant AH as AgentHandler
+    participant MS as MessageStore (短期)
     participant RA as Supervisor (Eino)
-    participant CS as CheckpointStore
     participant HITL as HITL (DOC-03)
 
-    Note over RA,CS: 首次请求
-    RA->>CS: Set(threadID, serializedCheckpoint)
-    RA-->>HITL: StatefulInterrupt → 中断
-
-    Note over RA,CS: 审批恢复（当前方案：重调 Generate）
-    Note over RA,CS: 未来 Eino 暴露编译选项后
-    RA->>CS: Get(threadID) → 加载检查点
-    RA->>RA: 还原状态，从中断点继续
+    AH->>MS: Get(threadID) → 加载完整原始历史
+    AH->>MS: Append(threadID, userMsg) ← 存储完整用户消息
+    AH->>RA: Generate(裁剪版 Prompt)
+    RA-->>AH: 回复 + 中间消息
+    AH->>MS: Append(threadID, agentReply + 中间消息) ← 存储完整回复
+    AH-->>HITL: 如有中断 → 等待审批
+    Note over AH,HITL: 恢复时：重调 Generate（节点重跑，DOC-03）
 ```
 
 ### 4. 完整流程总览
@@ -185,24 +193,23 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     START([用户请求]) --> AUTH[AuthMiddleware: 注入 UserContext]
-    AUTH --> LOAD_MEM[MemoryStore.Get: 加载长期记忆]
+    AUTH --> LOAD_HISTORY[MessageStore.Get: 加载对话历史]
+    LOAD_HISTORY --> LOAD_MEM[MemoryStore.List: 加载长期记忆]
     LOAD_MEM --> INJECT[构造 system 注入: 用户画像 + 偏好]
     INJECT --> BUILD[构造 fullMessages: system + 记忆 + history + userMsg]
     BUILD --> CTX[ContextManager.Process: 裁剪/摘要]
     CTX --> GEN[Supervisor.Generate]
-    GEN --> CHECK{需要写入长期记忆?}
+    GEN --> SAVE_REPLY[MessageStore.Append: 存储回复(短期)]
+    SAVE_REPLY --> CHECK{需要写入长期记忆?}
     CHECK -->|是| SAVE_MEM[MemoryStore.Put: 保存新偏好/事实]
     CHECK -->|否| REPLY[返回回复]
     SAVE_MEM --> REPLY
 
-    GEN -.->|Eino 自动| CPS[CheckpointStore.Set: 保存状态快照]
-    CPS -.->|会话结束| DEL[CheckpointStore.Delete: 清理]
-
     style LOAD_MEM fill:#fef3c7
     style INJECT fill:#fef3c7
     style SAVE_MEM fill:#fef3c7
-    style CPS fill:#e0e7ff
-    style DEL fill:#e0e7ff
+    style LOAD_HISTORY fill:#e0e7ff
+    style SAVE_REPLY fill:#e0e7ff
 ```
 
 ## 数据模型设计
@@ -232,87 +239,59 @@ type MemoryEntry struct {
 | 事实 | `fact_{领域}` | `fact_role`, `fact_team` |
 | 规则 | `rule_{领域}` | `rule_no_email_forwarding` |
 
-### CheckpointStore 数据（短期记忆）
+### CheckpointStore 预留数据（未接入）
 
-CheckpointStore 存储的是 Eino Graph 引擎的序列化状态（`[]byte`），业务代码不直接操作其内部结构。隔离键为 `thread_id`。
+`internal/hitl/store.go` 中的 `MemoryCheckpointStore` 存储的是 Eino Graph 引擎的序列化状态（`[]byte`），隔离键为 `thread_id`。该实现当前未接入任何 Agent Graph，为纯预留代码。
+
+## 短期记忆设计（MessageStore 对话历史）
+
+### 定位
+
+短期记忆由 **MessageStore** 承担，按 thread_id 存储完整对话历史（用户消息、Agent 回复、ToolCall/ToolResult 中间消息），提供会话续接能力。MessageStore 接口定义位于 `internal/context/store.go`（属 DOC-04 上下文管理模块，记忆子系统直接复用其能力）。
 
 ```go
-// Eino 原生接口
-type CheckPointStore interface {
-    Get(ctx context.Context, id string) (data []byte, existed bool, err error)
-    Set(ctx context.Context, id string, data []byte) error
-}
-
-type CheckPointDeleter interface {
-    Delete(ctx context.Context, id string) error
+// MessageStore 消息历史存储接口
+// 始终存储完整原始历史，裁剪版 Prompt 仅用于本次 LLM 调用，不回写 Store
+type MessageStore interface {
+    Get(ctx context.Context, threadID string) ([]*schema.Message, error) // 返回防御性副本
+    Append(ctx context.Context, threadID string, msg *schema.Message) error
+    Clear(ctx context.Context, threadID string) error
+    SetOwner(ctx context.Context, threadID string, userID int64) error // 首次写入时设置线程归属
+    GetOwner(ctx context.Context, threadID string) (int64, bool)        // 数据隔离校验
 }
 ```
 
-## CheckpointStore 设计（短期记忆）
+### 实现层级
 
-### 接口定义
+| 层级 | 实现 | 说明 |
+| ---- | ---- | ---- |
+| 基础档 | `MemoryMessageStore` | 基于 `sync.RWMutex + map`，进程内存储，重启丢失 |
+| 进阶档 | `RedisMessageStore` | 基于 Redis List + String，支持分布式部署和持久化 |
 
-CheckpointStore 直接实现 Eino `compose.CheckPointStore` + `compose.CheckPointDeleter` 接口，不自研抽象。
+### 短期记忆在 AgentHandler 中的使用
 
-```go
-// === Eino 原生接口（compose/checkpoint.go）===
-// 本项目直接实现，不自研
+`AgentHandler.Chat()` 中，短期记忆的读写时序为：
+1. `MessageStore.Get(thread_id)` — 加载完整原始历史
+2. `MessageStore.Append(thread_id, userMsg)` — 存储完整用户消息
+3. `SetOwner` — 首次写入时设置线程归属（数据隔离）
+4. `ContextManager.Process(全量历史)` — 裁剪版仅用于本次 LLM 调用，**不回写 Store**
+5. 执行 Agent，捕获中间 ToolCall/ToolResult 消息
+6. `MessageStore.Append` — 存储中间消息 + Agent 最终回复
 
-type CheckPointStore interface {
-    Get(ctx context.Context, id string) (data []byte, existed bool, err error)
-    Set(ctx context.Context, id string, data []byte) error
-}
-
-type CheckPointDeleter interface {
-    Delete(ctx context.Context, id string) error
-}
-```
-
-### InMemoryCheckpointStore 实现
-
-> 注：当前项目中 `internal/hitl/store.go` 已有 `MemoryCheckpointStore` 实现。DOC-05 将其正式纳入记忆子系统文档，并补充 `List` 能力供管理和清理使用。
-
-```go
-// InMemoryCheckpointStore 内存版检查点存储
-// 实现 Eino compose.CheckPointStore + CheckPointDeleter
-type InMemoryCheckpointStore struct {
-    mu   sync.RWMutex
-    data map[string][]byte  // threadID → 序列化状态
-    meta map[string]*CheckpointMeta // 业务元数据（与 Eino Checkpoint 平行存储）
-}
-
-// CheckpointMeta 检查点业务元数据
-type CheckpointMeta struct {
-    ThreadID  string    `json:"thread_id"`
-    UserID    int64     `json:"user_id"`     // 归属用户（安全校验用）
-    CreatedAt time.Time `json:"created_at"`  // 创建时间
-    UpdatedAt time.Time `json:"updated_at"`  // 最后更新时间
-    Size      int       `json:"size"`        // 数据大小（字节）
-}
-```
-
-### 方法列表
-
-| 方法 | 接口来源 | 说明 |
-| ---- | -------- | ---- |
-| `Get(ctx, id)` | Eino `CheckPointStore` | 按 threadID 获取序列化状态 |
-| `Set(ctx, id, data)` | Eino `CheckPointStore` | 按 threadID 保存序列化状态 |
-| `Delete(ctx, id)` | Eino `CheckPointDeleter` | 按 threadID 删除检查点 |
-| `ListByUser(ctx, userID)` | 扩展方法 | 列出指定用户的所有检查点（管理/清理用） |
-| `CleanupBefore(ctx, before)` | 扩展方法 | 清理指定时间之前的检查点（定期维护） |
+> **关键区分**：MessageStore 始终存完整原始历史；ContextManager.Process 输出的裁剪版仅用于本次 LLM 调用，绝不回写。这与 DOC-04 的"Store 存全量、Prompt 用裁剪版"原则一致。
 
 ### 与 DOC-03 的关系
 
-DOC-03 的 `ApprovalStore` 管理的是**审批状态**（业务语义），而 CheckpointStore 管理的是**运行状态**（引擎语义）。二者数据模型和生命周期截然不同：
+DOC-03 的 `ApprovalStore` 管理的是**审批状态**（业务语义），而 MessageStore（短期记忆）存储的是**对话历史**（业务数据）。二者数据模型和生命周期截然不同：
 
-| 维度 | ApprovalStore (DOC-03) | CheckpointStore (DOC-05) |
+| 维度 | ApprovalStore (DOC-03) | MessageStore (短期记忆) |
 | ---- | ---------------------- | ------------------------ |
-| 数据 | InterruptCard（审批卡片） | []byte（Eino 序列化状态） |
-| 隔离键 | threadID | threadID |
+| 数据 | InterruptCard（审批卡片） | schema.Message（消息历史） |
+| 隔离键 | threadID | threadID + userId（所有权） |
 | 生命周期 | 30 分钟 TTL，审批后删除 | 与会话绑定，可长期保留 |
-| 调用者 | HumanApprovalMiddleware | Eino Graph 引擎自动调用 |
+| 调用者 | HumanApprovalMiddleware | AgentHandler（Chat/ChatStream） |
 
-当前 DOC-03 的 `ApprovalStore` 和 DOC-05 的 `CheckpointStore` 共存于 `internal/hitl/store.go`，未来可拆分到各自的包中。
+此外，`internal/hitl/store.go` 中存在 `MemoryCheckpointStore` 预留实现（Eino `compose.CheckPointStore` + `CheckPointDeleter`），但因框架编译选项限制未接入，当前为纯预留代码。
 
 ## MemoryStore 设计（长期记忆）
 
@@ -474,9 +453,11 @@ func (h *AgentHandler) Chat(c *gin.Context) {
 }
 ```
 
-### 显式触发写入策略
+### 长期记忆提取策略（LLM 优先 + 规则兜底）
 
-当前采用**显式触发**策略：当用户的对话内容中包含明确的偏好声明或事实告知时，写入长期记忆。
+当前采用 **LLM 优先提取 + 规则兜底** 策略（由 `SaveMemoryFromConversation` 编排）：优先调用 `LLMMemoryExtractor` 从对话中自动提取用户画像/偏好/事实，通过 `ShouldTryLLMExtraction` 预过滤短消息以避免无效 LLM 调用；LLM 提取无结果或调用失败时，回退到规则匹配 `ExtractMemoryFromConversation`。提取出的条目按 userId 写入长期记忆。
+
+> 早期设想为"显式触发写入"（仅当用户消息含'请记住''我喜欢'等关键词时写入），现已演进为 LLM 自动提取，规则匹配仅作为兜底。
 
 触发条件（基于关键词匹配）：
 - "请记住..." / "记住我..." / "我偏好..." / "我喜欢..." / "我是..."
@@ -496,7 +477,7 @@ func shouldSaveMemory(userMessage string) bool {
 }
 
 // extractMemoryFromConversation 从对话中提取长期记忆条目
-// 当前为规则匹配实现，未来可扩展为 LLM 自动提取
+// 当前为规则匹配实现（LLM 提取器由 LLMMemoryExtractor 单独实现）
 func extractMemoryFromConversation(userMsg, assistantReply string) []*MemoryEntry {
     var entries []*MemoryEntry
 
@@ -706,11 +687,11 @@ def bubble_sort(arr): ...
 | 集成点 | 已有模块提供 | DOC-05 使用 |
 | ------ | ------------ | ----------- |
 | 身份校验 | `AuthMiddleware` + `UserContext` | userId 从 UserContext 获取，保障记忆隔离 |
-| 会话管理 | `SessionStore` | CheckpointStore 与 Session 生命周期关联 |
+| 会话管理 | `SessionStore` | 短期记忆（MessageStore）与 Session 生命周期关联 |
 | 权限检查 | `ACLToolMiddleware` | 记忆管理 API 需经 AuthMiddleware 校验 |
-| 中断恢复 | `ApprovalStore` (DOC-03) | CheckpointStore 为 HITL 提供状态持久化（Eino 原生） |
+| 中断恢复 | `ApprovalStore` (DOC-03) | MessageStore 为 HITL 恢复提供消息历史续接；CheckpointStore 预留未接入 |
 | 上下文管理 | `ContextManager` (DOC-04) | 长期记忆注入在 ContextManager.Process 之前；MessageStore 存全量 |
-| 消息历史 | `MessageStore` (DOC-04) | 短期记忆与 MessageStore 互补：MessageStore 存对话，CheckpointStore 存运行状态 |
+| 消息历史 | `MessageStore` (DOC-04) | MessageStore 直接充当短期记忆，存储完整对话历史 |
 
 ### 复用清单
 
@@ -718,10 +699,10 @@ def bubble_sort(arr): ...
 | -------- | ---- | -------------- |
 | `UserContext` / `UserContextFromCtx` | DOC-01 | 从请求 context 获取 userId |
 | `AuthMiddleware` | DOC-01 | 记忆 API 的身份校验 |
-| `MemoryCheckpointStore` | DOC-03 (`internal/hitl/store.go`) | 已实现 Eino CheckPointStore + CheckPointDeleter，直接复用 |
-| `MessageStore` | DOC-04 (`internal/context/store.go`) | 短期记忆的对话历史来源 |
+| `MessageStore` | DOC-04 (`internal/context/store.go`) | 短期记忆：存储完整对话历史，提供会话续接 |
 | `ContextManager.Process` | DOC-04 | 长期记忆注入消息后统一裁剪 |
 | `schema.Message` | Eino | 记忆注入使用 `schema.SystemMessage` |
+| `MemoryCheckpointStore` | DOC-03 (`internal/hitl/store.go`) | 预留实现，当前未接入（Eino 编译选项限制） |
 
 ## 异常处理设计
 
@@ -730,7 +711,7 @@ def bubble_sort(arr): ...
 | 长期记忆加载失败 | MemoryStore.Get/List 出错 | 降级：不注入记忆，正常对话 | 无感知 |
 | 长期记忆写入失败 | MemoryStore.Put 出错 | 降级：跳过写入，不影响对话 | 无感知 |
 | 长期记忆删除失败 | MemoryStore.Delete 出错 | 降级：返回 500 错误 | 提示删除失败 |
-| Checkpoint 加载失败 | CheckPointStore.Get 出错 | 降级：空状态启动新会话 | 无感知 |
+| Checkpoint 加载失败 | 预留场景（当前未接入） | 降级：空状态启动新会话 | 无感知 |
 | 记忆注入导致超窗口 | 注入后 Token 超限 | ContextManager.Process 自动裁剪 | 无感知 |
 | 记忆提取误判 | 用户语句包含触发词但非偏好 | 写入错误条目，用户可手动删除 | 可通过记忆面板管理 |
 
@@ -746,7 +727,10 @@ kingsoft-agent/
 │   │   ├── handler.go               # [新增] MemoryHandler HTTP 处理器（List/Put/Delete）
 │   │   └── inject.go                # [新增] 长期记忆注入逻辑（buildMemoryInjection + extractMemoryFromConversation）
 │   ├── hitl/                        # 中断-恢复（DOC-03）
-│   │   ├── store.go                 # ApprovalStore + MemoryCheckpointStore（短期记忆实现，已有）
+│   │   ├── store.go                 # ApprovalStore + MemoryCheckpointStore（预留实现，未接入）
+│   │   └── ...
+│   ├── context/                     # 上下文管理（DOC-04）
+│   │   ├── store.go                 # MessageStore 接口 + Memory/Redis 实现（短期记忆复用此能力）
 │   │   └── ...
 │   ├── agent/                       # Agent 编排
 │   │   ├── handler.go               # [变更] Chat/ChatStream 新增长期记忆加载/注入/后置写入
@@ -768,14 +752,15 @@ kingsoft-agent/
 | 跨会话偏好记忆 | 会话 A 中用户说"我喜欢用 Python" → 写入长期记忆 → 新建会话 B（不同 thread_id）→ 用户说"帮我写个脚本" → Agent 默认使用 Python |
 | 长期记忆 API | GET `/api/memory/list` 可查看已保存的偏好条目，POST `/api/memory/put` 可手动写入，DELETE `/api/memory/:key` 可删除 |
 | 多用户隔离 | 用户 A 写入的偏好（userId=1），用户 B（userId=2）的 `/api/memory/list` 看不到 |
-| 短期记忆 CheckpointStore | 实现 Eino `compose.CheckPointStore` + `CheckPointDeleter`，按 thread_id 隔离 |
+| 短期记忆 MessageStore | MessageStore 按 thread_id 存储完整对话历史，提供会话续接能力；含 SetOwner/GetOwner 隔离 |
 | 降级容错 | MemoryStore 加载/写入失败时，对话不中断，正常返回（无记忆降级） |
 | 隐私安全 | userId 从服务端 UserContext 获取，前端无法伪造；admin 无法查看其他用户记忆 |
 
 ### 代码结构要求
 
-- `CheckpointStore` 实现 Eino `compose.CheckPointStore` + `CheckPointDeleter` 接口，不自研检查点抽象
-- `MemoryStore` 定义为独立接口，内存版与持久化版可平滑切换
+- `MessageStore`（短期记忆）复用 DOC-04 上下文管理模块的接口实现，按 thread_id 存储完整对话历史
+- `MemoryCheckpointStore` 预留实现 Eino `compose.CheckPointStore` + `CheckPointDeleter` 接口，当前未接入（Eino 编译选项限制）
+- `MemoryStore` 定义为独立接口，内存版与 Redis 版可平滑切换
 - 长期记忆注入在 Handler 层执行，对 Agent 编排层透明
 - userId 从 `UserContext` 获取，不出现在请求参数中
 - 记忆子系统的所有异常降级处理，不中断对话流程

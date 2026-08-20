@@ -24,11 +24,13 @@
 
 **关键原则**：
 1. 用户在 Web 前端登录获取 Session
-2. Agent 调用携带 sessionId
+2. Agent 调用携带 sessionId（Bearer Token）
 3. Middleware 验证身份（每次调用均校验 sessionId 合法性，当存储中查无该会话时即判定非法，直接返回 401，请求不进入 Agent 执行）
 4. 生成 UserContext
 5. Agent 执行
 6. Tool 调用经过 ACL 检查（框架统一拦截，禁止在每个工具内部手写校验）
+
+> **权限拦截落地方式**：ACL 校验逻辑由本模块的 `ACLChecker` 提供，拦截执行点位于 DOC-02 的 `ACLToolMiddleware`（基于 Eino `ToolMiddleware`，嵌入 `ToolsNode` 调度链）。早期设计中曾考虑以 Eino Callback 形式的 `ToolInterceptor` 拦截，最终被 `ACLToolMiddleware` 取代（`internal/auth/interceptor.go` 中的 `ToolInterceptor` 已停用）。下文流程图统一以 `ACLToolMiddleware` 表达拦截点，回灌逻辑不变。
 
 ## 业务流程设计
 
@@ -64,7 +66,7 @@ sequenceDiagram
     participant U as 用户
     participant MW as AuthMiddleware
     participant AG as Agent (Eino Graph)
-    participant TI as ToolInterceptor
+    participant TM as ACLToolMiddleware
     participant T as Tool
 
     U->>MW: 请求 {sessionId, question}
@@ -74,14 +76,14 @@ sequenceDiagram
     else Session 有效
         MW->>MW: 构建 UserContext{userId, role, permissions}
         MW->>AG: 执行 Agent (携带 UserContext)
-        AG->>TI: 调用 Tool
-        TI->>TI: ACL 检查 (UserContext.permissions vs toolName+action)
+        AG->>TM: 调用 Tool
+        TM->>TM: ACL 检查 (UserContext.permissions vs toolName+action)
         alt 有权限
-            TI->>T: 执行 Tool
-            T-->>TI: 结果
-            TI-->>AG: 返回结果
+            TM->>T: 执行 Tool
+            T-->>TM: 结果
+            TM-->>AG: 返回结果
         else 无权限
-            TI-->>AG: 返回拒绝信息 (回灌)
+            TM-->>AG: 返回拒绝信息 (回灌)
         end
         AG-->>U: 最终回复
     end
@@ -91,7 +93,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A[Agent 决定调用 Tool] --> B[ToolInterceptor 拦截]
+    A[Agent 决定调用 Tool] --> B[ACLToolMiddleware 拦截]
     B --> C{ACL 检查}
     C -->|允许| D[执行 Tool]
     D --> E[返回结果给 Agent]
@@ -101,7 +103,7 @@ flowchart TD
     H --> I[Agent 尝试替代方案或告知用户]
 ```
 
-**回灌机制说明**：当 ToolInterceptor 拦截到越权调用时，不抛异常中断流程，而是将拒绝信息以结构化消息注入 Agent 当前上下文，使 Agent 能理解拒绝原因并自主调整后续行为（如换用允许的工具、请求用户授权等），而非直接报错终止。
+**回灌机制说明**：当 `ACLToolMiddleware` 拦截到越权调用时，不抛异常中断流程，而是将拒绝信息以结构化消息注入 Agent 当前上下文，使 Agent 能理解拒绝原因并自主调整后续行为（如换用允许的工具、请求用户授权等），而非直接报错终止。
 
 ## 数据存储
 
@@ -176,7 +178,7 @@ erDiagram
 | 字段 | 类型 | 约束 | 说明 |
 | ---- | ---- | ---- | ---- |
 | id | bigint | PK, AUTO_INCREMENT | 主键 |
-| name | varchar(32) | UK, NOT NULL | 角色名（如 admin, user） |
+| name | varchar(32) | UK, NOT NULL | 角色名（如 admin, visitor） |
 | description | varchar(256) | | 角色描述 |
 
 **预置角色**：
@@ -251,7 +253,7 @@ const (
 // 设计原则：对 LLM 不可见（不出现在 prompt 中），对 Tool 和节点可见（通过 context.Context 传递）
 type UserContext struct {
     UserID      int64          // 用户ID
-    Role        string         // 角色名（admin / user）
+    Role        string         // 角色名（admin / visitor）
     Permissions []Permission   // 当前用户拥有的权限列表
     SessionID   string         // 会话 Token
 }
@@ -278,43 +280,56 @@ func UserContextFromCtx(ctx context.Context) (*UserContext, bool) {
 type ACLChecker interface {
     // Allowed 判断指定角色是否允许对某工具执行某动作
     Allowed(ctx context.Context, role string, toolName string, action string) (bool, error)
+
+    // PermissionsForRole 获取指定角色的所有权限列表
+    PermissionsForRole(ctx context.Context, role string) ([]Permission, error)
 }
 
 // 默认实现基于内存 map 的 ACL 检查
-type memoryACLChecker struct {
+type MemoryACLChecker struct {
     // rolePermissions: map[role] -> map[toolName] -> map[action] -> bool
     rolePermissions map[string]map[string]map[string]bool
+    // permissions:    map[toolName+"::"+action] -> Permission（供 PermissionsForRole 返回）
+    permissions     map[string]Permission
+    // superRoles:     超级角色集合（拥有所有权限）
+    superRoles      map[string]bool
 }
 ```
 
 **ACL 检查逻辑**：
 1. 从 `UserContext` 获取用户角色 `role`
-2. 以 `role + toolName + action` 为 key 查找权限表
-3. 存在且为 `true` → 允许；否则 → 拒绝
-4. `admin` 角色默认拥有所有权限（可配置超级角色白名单）
+2. 超级角色（`superRoles`）直接允许所有操作
+3. 以 `role + toolName + action` 为 key 查找权限表
+4. 存在且为 `true` → 允许；否则 → 拒绝
 
 ### SessionStore 接口
 
 ```go
 // SessionStore 会话存储抽象接口
 type SessionStore interface {
-    // Create 创建新会话
+    // Create 创建新会话，若用户活跃会话数已达上限则自动淘汰最早的
     Create(ctx context.Context, session *Session) error
 
-    // Get 根据 token 获取会话，若已过期自动标记为 expired 并返回 ErrSessionExpired
-    Get(ctx context.Context, token string) (*Session, error)
+    // Get 根据 sessionID 获取会话，若已过期自动标记为 expired 并返回 ErrSessionExpired
+    Get(ctx context.Context, sessionID string) (*Session, error)
 
     // Delete 删除会话（主动登出时调用）
-    Delete(ctx context.Context, token string) error
+    Delete(ctx context.Context, sessionID string) error
 
-    // Renew 续期会话，将 expires_at 延长一个 TTL
-    Renew(ctx context.Context, token string) error
+    // Renew 续期会话，将 expires_at 延长一个 TTL（不超过最大生命周期）
+    Renew(ctx context.Context, sessionID string) error
+
+    // Close 停止后台清理协程（内存版需要，Redis 版无操作）
+    Close()
 }
 
 // 错误定义
 var (
-    ErrSessionNotFound = errors.New("session not found")
-    ErrSessionExpired  = errors.New("session expired")
+    ErrUserNotFound     = errors.New("user not found")
+    ErrRoleNotFound     = errors.New("role not found")
+    ErrSessionNotFound  = errors.New("session not found")
+    ErrSessionExpired   = errors.New("session expired")
+    ErrDuplicateUsername = errors.New("duplicate username")
 )
 ```
 
@@ -332,8 +347,10 @@ var (
 | 方法 | 路径 | 请求体 | 响应体 | 说明 |
 | ---- | ---- | ------ | ------ | ---- |
 | POST | `/api/auth/login` | `{"username":"xxx","password":"xxx"}` | `{"session_id":"xxx","expires_in":1800}` | 用户登录 |
+| POST | `/api/auth/register` | `{"username":"xxx","password":"xxx"}` | `{"user_id":2,"role":"visitor"}` | 用户注册（默认 visitor 角色） |
 | POST | `/api/auth/logout` | _(Header: Authorization: Bearer {sessionId})_ | `{"message":"ok"}` | 用户登出 |
 | GET | `/api/auth/session` | _(Header: Authorization: Bearer {sessionId})_ | `{"user_id":1,"role":"admin","expires_at":"..."}` | 校验/查询当前会话 |
+| GET | `/api/auth/roles` | _(公开)_ | `{"roles":[...]}` | 获取角色列表 |
 
 ### 权限相关接口
 
@@ -345,7 +362,9 @@ var (
 
 | 方法 | 路径 | 请求体 | 响应体 | 说明 |
 | ---- | ---- | ------ | ------ | ---- |
-| POST | `/api/agent/chat` | `{"session_id":"xxx","message":"xxx","thread_id":"xxx"}` | `{"reply":"xxx","thread_id":"xxx"}` | 与 Agent 对话（流式响应可选） |
+| POST | `/api/agent/chat` | `{"thread_id":"xxx","message":"xxx"}` | `{"reply":"xxx","thread_id":"xxx"}` | 与 Agent 对话（流式响应可选） |
+
+> sessionId 通过请求头 `Authorization: Bearer {sessionId}` 携带，经 AuthMiddleware 校验后 UserContext 注入 `context.Context`；请求体只含 `thread_id` 与 `message`。
 
 ### 错误响应格式
 
@@ -391,7 +410,9 @@ var (
 - **CSRF**：API 层使用 Bearer Token 认证，天然防 CSRF
 - **输入校验**：所有接口参数做白名单校验，防止注入
 
-## ToolInterceptor 实现
+## ToolInterceptor 实现（已被 ACLToolMiddleware 取代）
+
+> **注意**：下文描述的 `ToolInterceptor`（基于 Eino Callback）为早期设计方案。实际项目中 `internal/auth/interceptor.go` 的 `ToolInterceptor` 已停用（整函数注释掉），ACL 权限拦截改由 DOC-02 的 `ACLToolMiddleware`（基于 Eino `ToolMiddleware`，嵌入 `ToolsNode` 调度链）统一执行。以下保留回灌逻辑描述供参考，因其思路与 `ACLToolMiddleware` 一致。
 
 ```go
 // ToolInterceptor 工具调用拦截器

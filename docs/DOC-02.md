@@ -49,7 +49,6 @@ flowchart TB
         MA["MathAgent<br/>(ReAct)"]
         SEA["SearchAgent<br/>(ReAct)"]
         AA["AdminAgent<br/>(ReAct)"]
-        GA["GeneralAgent<br/>(ReAct)"]
     end
 
     subgraph ToolLayer["工具层 (Eino ToolsNode)"]
@@ -62,8 +61,8 @@ flowchart TB
     end
 
     MW --> SA
-    SA --> MA & SEA & AA & GA
-    MA & SEA & AA & GA --> TN
+    SA --> MA & SEA & AA
+    MA & SEA & AA --> TN
     TN --> TM --> T1 & T2 & T3 & T4
 ```
 
@@ -121,7 +120,6 @@ sequenceDiagram
     participant MA as MathAgent (Specialist)
     participant SEA as SearchAgent (Specialist)
     participant AA as AdminAgent (Specialist)
-    participant GA as GeneralAgent (Specialist)
 
     U->>MW: 请求 {sessionId, message}
     MW->>MW: 校验 Session，注入 UserContext
@@ -137,9 +135,6 @@ sequenceDiagram
     else 选择 AdminAgent
         SV->>AA: HandOff (管理员工具任务)
         AA-->>SV: 结果
-    else 选择 GeneralAgent
-        SV->>GA: HandOff (通用任务)
-        GA-->>SV: 结果
     else 直接回答
         SV-->>U: 直接回复
     end
@@ -162,7 +157,7 @@ flowchart TD
     I --> J[LLM 尝试替代方案或告知用户]
 ```
 
-**回灌机制说明**：与 DOC-01 中 `ToolInterceptor` 的回灌逻辑一致。当 `ACLToolMiddleware` 拦截到越权调用时，不抛异常中断流程，而是构造 `ToolMessage`（content 为拒绝原因，标记 isError）返回给 ReAct 循环，LLM 能理解拒绝原因并自主调整后续行为。
+**回灌机制说明**：与 DOC-01 中 ACL 拦截的回灌逻辑一致（DOC-01 早期的 `ToolInterceptor` 已被本模块 `ACLToolMiddleware` 取代）。当 `ACLToolMiddleware` 拦截到越权调用时，不抛异常中断流程，而是构造 `ToolMessage`（content 为拒绝原因，标记 isError）返回给 ReAct 循环，LLM 能理解拒绝原因并自主调整后续行为。
 
 ## 数据模型设计
 
@@ -212,15 +207,15 @@ type ToolResult struct {
 }
 ```
 
-### SpecialistAgent 定义
+### SpecialistDef 专家 Agent 定义
 
 ```go
-// SpecialistAgent 专家 Agent 定义（注册到 Supervisor）
-type SpecialistAgent struct {
-    Name        string                    // Agent 名称，同时作为 Host 侧的工具名
-    IntendedUse string                    // 用途描述，作为 Host 侧的工具描述
-    Agent       compose.Invoke[[]*schema.Message, *schema.Message, agent.AgentOption]
-    SystemPrompt string                   // Agent 系统提示词
+// SpecialistDef 专家 Agent 定义（供 BuildSpecialists 构建 ReAct Agent + Host Specialist）
+type SpecialistDef struct {
+    Name         string   // Agent 名称，同时作为 Host 侧的工具名
+    IntendedUse  string   // 用途描述，作为 Host 侧的工具描述
+    SystemPrompt string   // Agent 系统提示词
+    ToolNames    []string // 该 Agent 可调用的工具名列表（由 BuildSpecialists 按 ToolNames 查找注册工具）
 }
 ```
 
@@ -354,7 +349,7 @@ func ACLToolMiddleware(aclChecker auth.ACLChecker) compose.ToolMiddleware {
 | 放行方式 | 返回 `(nil, nil)` | 调用 `next(ctx, input)` |
 | 推荐使用 | 简单场景、Callback 链 | 复杂场景、需要与 ToolsNode 编排 |
 
-> **建议**：DOC-02 实现后，`ACLToolMiddleware` 替代 DOC-01 的 `ToolInterceptor` 作为主要的权限拦截机制。`ToolInterceptor` 保留作为 Callback 层的补充观测点（如日志、审计），不再承担拦截职责。
+> **结论**：`ACLToolMiddleware` 为本项目唯一的 ACL 权限拦截机制。DOC-01 早期设计的 `ToolInterceptor`（Callback 形式）未投入使用（`internal/auth/interceptor.go` 中整函数注释保留），不再承担拦截或观测职责；如需工具调用审计/日志，通过 Eino Callback（见 DOC-02「Callback 观测点」）独立实现。
 
 ## ReAct Agent 设计
 
@@ -457,8 +452,9 @@ type Specialist struct {
 | ----- | ---- | -------- | ----------- |
 | MathAgent | 数学计算 | Calculator | 处理数学计算、算术运算、公式求解等任务 |
 | SearchAgent | 信息查询 | GrepFiles | 处理文件内容搜索、模式匹配等任务 |
-| AdminAgent | 管理员工具 | HashCompute | 处理哈希计算等管理员工具任务 |
-| GeneralAgent | 普通问答 | 无 | 处理日常对话、知识问答等通用任务 |
+| AdminAgent | 管理员工具 | HashCompute + SendEmail | 处理哈希计算、发送邮件等管理员工具任务 |
+
+> 未命中任一 Specialist 的通用问答由 Supervisor 的 Host LLM 直接回答，无需独立 GeneralAgent。
 
 ### Supervisor 路由流程
 
@@ -472,12 +468,10 @@ flowchart TB
     HANDOFF --> MATH["MathAgent<br/>(ReAct循环)"]
     HANDOFF --> SEARCH["SearchAgent<br/>(ReAct循环)"]
     HANDOFF --> ADMIN["AdminAgent<br/>(ReAct循环)"]
-    HANDOFF --> GENERAL["GeneralAgent<br/>(ReAct循环)"]
 
     MATH --> RESULT{多个 Specialist?}
     SEARCH --> RESULT
     ADMIN --> RESULT
-    GENERAL --> RESULT
 
     RESULT -->|单 Specialist| END
     RESULT -->|多 Specialist| SUM["Summarizer 合并结果"]
@@ -505,9 +499,7 @@ func createSupervisorAgent(
     searchAgent, err := createReActAgent(ctx, specialistModel,
         []tool.BaseTool{grepFilesTool}, aclMiddleware, DefaultMaxIterations)
     adminAgent, err := createReActAgent(ctx, specialistModel,
-        []tool.BaseTool{hashComputeTool}, aclMiddleware, DefaultMaxIterations)
-    generalAgent, err := createReActAgent(ctx, specialistModel,
-        nil, aclMiddleware, DefaultMaxIterations)
+        []tool.BaseTool{hashComputeTool, sendEmailTool}, aclMiddleware, DefaultMaxIterations)
 
     // 2. 构建 MultiAgent
     return host.NewMultiAgent(ctx, &host.MultiAgentConfig{
@@ -527,14 +519,9 @@ func createSupervisorAgent(
                 SystemPrompt: "你是一个文件搜索助手，使用 grep_files 工具搜索文件内容。",
             },
             {
-                AgentMeta:   host.AgentMeta{Name: "AdminAgent", IntendedUse: "处理哈希计算等管理员工具任务"},
+                AgentMeta:   host.AgentMeta{Name: "AdminAgent", IntendedUse: "处理哈希计算、发送邮件等管理员工具任务"},
                 Invokable:   adminAgent.Generate,
-                SystemPrompt: "你是一个管理员工具助手，可以使用哈希计算工具完成任务。",
-            },
-            {
-                AgentMeta:   host.AgentMeta{Name: "GeneralAgent", IntendedUse: "处理通用问答任务"},
-                Invokable:   generalAgent.Generate,
-                SystemPrompt: "你是一个通用问答助手，直接回答用户问题。",
+                SystemPrompt: "你是一个管理员工具助手，可以使用哈希计算和邮件发送工具完成任务。",
             },
         },
         Summarizer: &host.Summarizer{
@@ -609,7 +596,7 @@ UserMessage("计算hello的SHA256") (visitor角色)
 | 方法 | 路径 | 请求体 | 响应体 | 说明 |
 | ---- | ---- | ------ | ------ | ---- |
 | POST | `/api/agent/chat` | `{"message":"xxx","thread_id":"xxx"}` | `{"reply":"xxx","thread_id":"xxx"}` | 与 Agent 对话 |
-| POST | `/api/agent/chat/stream` | `{"message":"xxx","thread_id":"xxx"}` | `SSE: data: {"delta":"..."}` | 与 Agent 对话（流式） |
+| GET | `/api/agent/chat/stream` | `{"message":"xxx","thread_id":"xxx"}` | `SSE: data: {"delta":"..."}` | 与 Agent 对话（流式） |
 
 > 请求头需携带 `Authorization: Bearer {sessionId}`，经 AuthMiddleware 校验后 UserContext 注入 context.Context。
 
@@ -753,7 +740,7 @@ kingsoft-agent/
 | 身份上下文 | `UserContext` + `context.Context` | 沿 Eino 调用链透传 |
 | 权限检查 | `ACLChecker.Allowed()` | `ACLToolMiddleware` 调用 |
 | 会话管理 | `SessionStore` | Agent 对话关联 Session |
-| 回灌机制 | `ToolInterceptor` | `ACLToolMiddleware` 替代，ToolInterceptor 降级为 Callback 观测 |
+| 回灌机制 | `ACLChecker` + 拦截点 | `ACLToolMiddleware` 统一拦截；DOC-01 早期 `ToolInterceptor`（Callback 形式）已停用 |
 
 ## 安全设计
 
@@ -774,7 +761,7 @@ kingsoft-agent/
 
 ### 限流与超时
 - Agent 对话接口限流：同一用户每分钟 20 次请求
-- 单次 Agent 执行超时：60 秒（通过 `context.WithTimeout` 控制）
+- 单次 Agent 执行超时：180 秒（通过 `context.WithTimeout` 控制）
 - 单次 ReAct 循环最大步数：20 步（`DefaultMaxIterations`）
 
 ## 交付物清单与验收标准
@@ -788,7 +775,7 @@ kingsoft-agent/
 | Supervisor 路由 | 用户提问"2+3等于多少"，Supervisor 正确路由到 MathAgent |
 | 多 Agent 路由 | 不同类型问题被路由到不同 Specialist（数学 → MathAgent，搜索 → SearchAgent，哈希 → AdminAgent） |
 | 迭代保护 | 构造触发无限循环的场景，Agent 在 20 步后返回"已达迭代上限" |
-| 超时保护 | 长时间运行的 Agent 在 60 秒后返回超时提示 |
+| 超时保护 | 长时间运行的 Agent 在 180 秒后返回超时提示 |
 
 ### 代码结构要求
 
