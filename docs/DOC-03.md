@@ -381,21 +381,32 @@ type ChatResponse struct {
 
 ### 核心实现
 
+`ApprovalStore` 定义为接口，便于内存版与 Redis 版平滑切换（与 SessionStore/MessageStore/MemoryStore 一致）。
+
 ```go
-// ApprovalStore 待审批状态存储
+// ApprovalStore 待审批状态存储接口
 // 独立于请求 context 生命周期，数据操作不受 context 取消影响
-type ApprovalStore struct {
-    mu       sync.RWMutex
-    cards    map[string]*InterruptCard // key: threadID
-    stopCh   chan struct{}
+type ApprovalStore interface {
+    AddApproval(ctx context.Context, threadID string, card *InterruptCard)
+    GetApproval(ctx context.Context, threadID string) *InterruptCard // 已过期自动删除并返回 nil
+    RemoveApproval(ctx context.Context, threadID string)             // 恢复时调用，保证一次性消费
+    ListApprovals(ctx context.Context) []*InterruptCard              // 管理员查看
+    Close()                                                          // 停止后台清理协程（内存版需要，Redis 版无操作）
 }
 
-func NewApprovalStore() *ApprovalStore {
-    s := &ApprovalStore{
+// MemoryApprovalStore 内存版待审批状态存储
+type MemoryApprovalStore struct {
+    mu     sync.RWMutex
+    cards  map[string]*InterruptCard // key: threadID
+    stopCh chan struct{}
+}
+
+func NewMemoryApprovalStore() *MemoryApprovalStore {
+    s := &MemoryApprovalStore{
         cards:  make(map[string]*InterruptCard),
         stopCh: make(chan struct{}),
     }
-    go s.cleanupExpired() // 后台清理过期审批卡片
+    go s.cleanup() // 后台清理过期审批卡片
     return s
 }
 ```
@@ -688,7 +699,7 @@ func (h *AgentHandler) Resume(c *gin.Context) {
 | 接口 | 路径 | 说明 |
 | ---- | ---- | ---- |
 | `ChatStream` | `GET /api/agent/chat/stream` | 流式对话，实时推送 thinking/tool_call/tool_result/answer/interrupt 事件 |
-| `ResumeStream` | `GET /api/agent/checkpoint/:thread_id/decide/stream` | 流式审批恢复，实时推送恢复后的执行步骤 |
+| `ResumeStream` | `POST /api/agent/checkpoint/:thread_id/decide/stream` | 流式审批恢复，实时推送恢复后的执行步骤（POST，避免 CSRF 风险） |
 
 SSE 事件类型：
 
@@ -743,7 +754,7 @@ func NewSendEmailTool() (tool.InvokableTool, error) {
 | 方法 | 路径 | 请求体 | 响应体 | 说明 |
 | ---- | ---- | ------ | ------ | ---- |
 | POST | `/api/agent/checkpoint/{thread_id}/decide` | `{"decision":"approve/reject","comment":"..."}` | `{"reply":"xxx","thread_id":"xxx"}` | 提交审批决策（非流式） |
-| GET | `/api/agent/checkpoint/{thread_id}/decide/stream` | _(Query: decision, comment)_ | SSE 事件流 | 提交审批决策（流式） |
+| POST | `/api/agent/checkpoint/{thread_id}/decide/stream` | `{"decision":"approve","comment":"..."}` | SSE 事件流 | 提交审批决策（流式，POST 避免 CSRF） |
 | GET | `/api/agent/checkpoints` | _(无)_ | `{"checkpoints":[...]}` | 查询待审批检查点 |
 
 ### 变更接口

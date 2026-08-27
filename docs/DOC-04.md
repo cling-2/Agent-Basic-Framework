@@ -972,6 +972,7 @@ func separateSystemMessages(messages []*schema.Message) (systemMsgs, nonSystemMs
 | 方法 | 路径 | 请求体 | 响应体 | 说明 |
 | ---- | ---- | ------ | ------ | ---- |
 | GET | `/api/context/stats` | _(Query: thread_id, Header: Authorization)_ | `{"thread_id":"xxx","message_count":15,"token_count":3200,"max_tokens":8000}` | 查询当前线程上下文统计 |
+| GET | `/api/context/history` | _(Query: thread_id, Header: Authorization)_ | `{"thread_id":"xxx","messages":[...]}` | 获取当前线程消息历史（过滤系统/工具消息，合并连续 assistant，丰富中断元数据） |
 | POST | `/api/context/config` | _(需 admin 角色)_ `{"max_messages":20,"max_tokens":8000,"summary_threshold":0.8}` | `{"message":"ok"}` | 更新上下文管理配置 |
 
 ### 上下文统计响应

@@ -104,6 +104,117 @@ flowchart TB
 
 **数据流**：请求经 Session 校验 → 注入 UserContext → 加载消息历史 + 记忆注入 → 上下文管理（裁剪/摘要） → Agent 编排执行 → ToolMiddleware 链式拦截（ACL → HITL）→ 执行或回灌 → 保存消息/提取记忆 → 返回结果。
 
+## 快速启动
+
+### 前置条件
+
+| 依赖 | 版本 | 用途 |
+| ---- | ---- | ---- |
+| Go | 1.24+ | 后端编译运行 |
+| Node.js | 20+ | 前端构建（仅首次或改前端时需要） |
+| Redis | 7+ | 持久化存储（可选，不可用时自动降级为内存存储） |
+
+### 环境变量
+
+项目根目录 `.env` 文件包含 LLM 配置，但**不会自动加载**（项目未使用 godotenv），需手动 `export` 或由 Docker Compose 注入：
+
+| 变量 | 必填 | 说明 | 示例 |
+| ---- | ---- | ---- | ---- |
+| `LLM_API_KEY` | 是 | LLM API 密钥 | `sk-xxx` |
+| `LLM_BASE_URL` | 是 | LLM API 地址 | `http://120.92.93.37/v1` |
+| `LLM_MODEL` | 是 | 模型名称 | `glm-5.1` |
+| `REDIS_ADDR` | 否 | Redis 地址，默认 `localhost:6379` | `localhost:6379` |
+
+> 未配置 LLM 环境变量时，系统自动回退到 MockChatModel（确定性本地推理，无需外部 API）。
+
+### 方式一：Docker Compose（推荐，自带 Redis 持久化）
+
+```bash
+docker compose up -d        # 启动（复用本地镜像，不重新构建）
+docker compose down         # 停止
+docker compose logs -f app  # 查看实时日志
+```
+
+启动后访问 http://localhost:8080。Redis 数据持久化在 Docker volume 中，重启不丢失。
+
+**代码变更后重新构建**：
+
+```bash
+docker compose up --build   # 重新构建镜像并启动
+```
+
+> ⚠️ `--build` 需要拉取基础镜像（golang/node/alpine）。如果镜像源不可用，改用下方方式三。
+
+### 方式二：go run 直跑（开发推荐）
+
+最简单的本地开发方式，改代码后 Ctrl+C 重跑即可。
+
+```bash
+# 1. 启动 Redis（如果尚未运行）
+docker run -d -p 6379:6379 --name redis redis:7-alpine
+
+# 2. 加载环境变量并启动后端
+export LLM_API_KEY=sk-xxx
+export LLM_BASE_URL=http://120.92.93.37/v1
+export LLM_MODEL=glm-5.1
+export REDIS_ADDR=localhost:6379
+go run ./cmd/server/
+```
+
+启动后访问 http://localhost:8080。
+
+不配 Redis 也能跑——省略 `REDIS_ADDR` 即自动降级为内存存储（重启丢数据）。
+
+**前后端分离开发**（修改前端时使用）：
+
+```bash
+# 终端1 — 后端（同上）
+go run ./cmd/server/
+
+# 终端2 — 前端热更新（Vite 默认端口 5173，自动代理到后端 8080）
+cd web && npm install && npm run dev
+```
+
+### 方式三：本地编译 + Docker 热替换（镜像源不可用时的备用方案）
+
+当 `docker compose up --build` 因镜像源拉取失败无法执行时，可在本地交叉编译后直接替换容器中的二进制：
+
+```bash
+# 1. 编译 Linux 二进制
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o server ./cmd/server/
+
+# 2. 构建覆盖镜像（基于已有的本地镜像，只替换二进制）
+mkdir -p _deploy && cp server _deploy/server
+echo -e "FROM kingsoft-training-app:latest\nCOPY server /app/server" > _deploy/Dockerfile
+docker build -t kingsoft-training-app:latest -f _deploy/Dockerfile _deploy
+
+# 3. 重启容器
+docker compose up -d --force-recreate app
+
+# 4. 清理
+rm -rf _deploy
+```
+
+或使用项目提供的脚本：
+
+```bash
+bash deploy-local.sh
+```
+
+### 常用运维命令
+
+```bash
+# Docker 方式
+docker compose ps                          # 查看容器状态
+docker compose logs -f app                 # 查看后端实时日志
+docker compose restart app                 # 重启后端
+docker compose exec redis redis-cli ping   # 检查 Redis 连通性
+
+# go run 方式
+curl -s http://localhost:8080/api/settings/status  # 检查 LLM 配置状态
+curl -s http://localhost:8080/api/auth/session     # 查询当前会话
+```
+
 ## 角色与权限
 
 ### 预置角色与工具范围

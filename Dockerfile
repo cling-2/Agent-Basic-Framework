@@ -1,5 +1,5 @@
 # ===== Stage 1: 构建前端 =====
-FROM docker.1ms.run/node:20-alpine AS frontend
+FROM node:20-alpine AS frontend
 
 WORKDIR /build/web
 
@@ -14,7 +14,7 @@ COPY web/ ./
 RUN npm run build
 
 # ===== Stage 2: 构建后端 =====
-FROM docker.1ms.run/golang:1.24-alpine AS backend
+FROM golang:1.24-alpine AS backend
 
 # 使用国内 Go 模块代理
 ENV GOPROXY=https://goproxy.cn,direct
@@ -32,7 +32,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o server ./cmd/server/
 
 # ===== Stage 3: 最小运行时镜像 =====
-FROM docker.1ms.run/alpine:3.19
+FROM alpine:3.19
 
 # 时区数据和 CA 证书（HTTPS 请求需要）
 RUN apk add --no-cache ca-certificates tzdata
